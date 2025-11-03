@@ -1,0 +1,8 @@
+# Secreto
+.env
+
+# Historial de VS Code
+.history/
+
+# Dependencias de Node
+node_modules/
