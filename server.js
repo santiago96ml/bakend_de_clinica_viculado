@@ -1,8 +1,7 @@
 // =======================================================================================
-// FUSIÓN VINTEX: ORQUESTADOR (Logic Creds) + CLINIC BACKEND (Business Logic)
+// SERVIDOR SATÉLITE VINTEX - CORREGIDO Y SEGURO
 // =======================================================================================
 
-// 1. IMPORTACIÓN DE MÓDULOS
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -12,52 +11,56 @@ const bcrypt = require('bcryptjs');
 const { z } = require('zod');
 const rateLimit = require('express-rate-limit');
 
-// 2. CONFIGURACIÓN INICIAL DEL APP
+// 1. CONFIGURACIÓN INICIAL
 const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*' }));
+// SEGURIDAD: Configurar CORS para aceptar solo tu frontend (o * en desarrollo)
+app.use(cors({ 
+    origin: process.env.FRONTEND_URL || '*', 
+    methods: ['GET', 'POST', 'PATCH', 'DELETE']
+}));
 app.use(express.json());
 
-// Variables globales para el cliente de la clínica (se llenarán dinámicamente)
-let supabase; 
-let JWT_SECRET;
+// Variables globales dinámicas (se llenan al arrancar)
+let clinicSupabase = null; 
+let clinicJwtSecret = null;
+let isReady = false; 
 
-// =======================================================================================
-// PARTE 1: LÓGICA DE CREDENCIALES (Inspirado en Código 1)
-// =======================================================================================
-
+// --- VARIABLES DE ENTORNO CRÍTICAS (Deben estar en el panel del hosting) ---
 const MASTER_URL = process.env.MASTER_SUPABASE_URL;
 const MASTER_KEY = process.env.MASTER_SUPABASE_SERVICE_KEY;
 const CLINIC_USER_ID = process.env.CLINIC_USER_ID;
 
+// Verificación de seguridad al inicio
 if (!MASTER_URL || !MASTER_KEY || !CLINIC_USER_ID) {
-    console.error("❌ ERROR FATAL: Faltan credenciales MAESTRAS o CLINIC_USER_ID en .env");
+    console.error("❌ ERROR FATAL: Faltan variables de entorno (MASTER_... o CLINIC_USER_ID).");
     process.exit(1);
 }
 
-// Cliente Maestro (Solo para arrancar)
+// Cliente Maestro (Solo para leer configuración inicial)
 const masterSupabase = createClient(MASTER_URL, MASTER_KEY, {
     auth: { autoRefreshToken: false, persistSession: false }
 });
 
+// 2. SECUENCIA DE ARRANQUE (BOOTSTRAP)
 async function bootServer() {
-    console.log("⏳ Iniciando secuencia de arranque (Orquestador)...");
+    console.log(`⏳ Iniciando Satélite para ID Clínica: ${CLINIC_USER_ID}...`);
     
     try {
-        // A. Verificar servicio activo en la Master
+        // A. Verificar si el servicio 'web_clinica' está activo en la Master DB
         const { data: servicio, error: servError } = await masterSupabase
             .from('servisi')
             .select('web_clinica')
             .eq('ID_User', CLINIC_USER_ID)
             .single();
 
-        if (servError || !servicio || !servicio.web_clinica) {
-            throw new Error('Servicio Web Clínica no activo o no autorizado en la Master DB.');
+        if (servError || !servicio?.web_clinica) {
+            throw new Error('Servicio Web Clínica inactivo o no autorizado en Master.');
         }
 
-        // B. Obtener secretos de la tabla 'web_clinica'
+        // B. Descargar secretos desde la tabla 'web_clinica'
         const { data: config, error: configError } = await masterSupabase
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_SERVICE_KEY, JWT_SECRET')
@@ -65,257 +68,211 @@ async function bootServer() {
             .single();
 
         if (configError || !config) {
-            throw new Error('Configuración no encontrada en web_clinica para este usuario.');
+            throw new Error('No se encontró configuración técnica en web_clinica.');
         }
 
-        // C. Asignar credenciales a las variables globales
-        console.log(`🔐 Credenciales obtenidas para Clinic ID: ${CLINIC_USER_ID}`);
+        // C. Inicializar el Cliente Local de la Clínica
+        clinicJwtSecret = config.JWT_SECRET;
+        clinicSupabase = createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY);
         
-        JWT_SECRET = config.JWT_SECRET;
-        supabase = createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY);
-        
-        console.log("✅ Cliente Supabase de la CLÍNICA inicializado correctamente.");
-        
-        // D. Iniciar el servidor Express (solo después de tener la config)
-        startExpressServer();
+        isReady = true;
+        console.log("✅ SISTEMA ONLINE: Conectado a la Base de Datos de la Clínica.");
 
     } catch (error) {
-        console.error('❌ Error crítico en el arranque:', error.message);
-        process.exit(1);
+        console.error('❌ Fallo crítico de arranque:', error.message);
+        // No cerramos el proceso para permitir reintentos o diagnósticos, pero el estado queda isReady=false
     }
 }
 
-// =======================================================================================
-// PARTE 2: LÓGICA DE NEGOCIO (100% Código 2)
-// =======================================================================================
+// 3. MIDDLEWARES
 
-// Middlewares de Rate Limit
-const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, 
-    max: 10,
-    message: 'Demasiados intentos de inicio de sesión.',
-    standardHeaders: true, legacyHeaders: false,
-});
+// Bloqueo hasta que el servidor esté listo
+const checkReady = (req, res, next) => {
+    if (!isReady) return res.status(503).json({ error: 'Servidor iniciándose, por favor espere...' });
+    next();
+};
 
-const apiLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000, 
-    max: 100,
-    message: 'Demasiadas peticiones a la API.',
-    standardHeaders: true, legacyHeaders: false,
-});
-
-app.use('/api/', apiLimiter);
-
-// Middleware de Autenticación
-function authenticateToken(req, res, next) {
-    // Verificación de seguridad por si el servidor arrancó mal
-    if (!JWT_SECRET) return res.status(500).json({ error: 'Servidor no inicializado correctamente.' });
-
+// Autenticación JWT
+const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
-    if (token == null) return res.status(401).json({ error: 'Acceso denegado.' });
+    if (!token) return res.status(401).json({ error: 'Token requerido.' });
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Token inválido.' });
+    jwt.verify(token, clinicJwtSecret, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Token inválido o expirado.' });
         req.user = user;
         next();
     });
-}
+};
 
-// --- ESQUEMAS ZOD (Tal cual Código 2) ---
-const idSchema = z.number().int().positive();
+// Rate Limiter
+const apiLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 200 }); // 200 req/min
+app.use('/api/', apiLimiter);
+
+// 4. SCHEMAS DE VALIDACIÓN (ZOD)
 const loginSchema = z.object({
     email: z.string().email(),
     password: z.string().min(6),
-}).strict();
-
-const citasRangeSchema = z.object({
-    start: z.string().datetime(),
-    end: z.string().datetime(),
-}).strict();
-
-const citaBaseSchema = z.object({
-    doctor_id: idSchema,
-    fecha_hora: z.string().datetime(),
-    timezone: z.string(),
-    descripcion: z.string().optional(),
-    duracion_minutos: z.number().int().positive(),
-    estado: z.enum(['programada', 'confirmada', 'cancelada', 'completada', 'no_asistio']),
 });
 
-const nuevaCitaSchema = citaBaseSchema.extend({
-    cliente_id: idSchema.optional(),
+const nuevaCitaSchema = z.object({
+    doctor_id: z.number(),
+    fecha_hora: z.string().datetime(), // ISO 8601
+    duracion_minutos: z.number().int().positive(),
+    estado: z.enum(['programada', 'confirmada', 'cancelada', 'completada', 'no_asistio']),
+    descripcion: z.string().optional(),
+    timezone: z.string().optional(),
+    // Datos opcionales para cliente
+    cliente_id: z.number().optional(),
     new_client_name: z.string().optional(),
     new_client_dni: z.string().optional(),
     new_client_telefono: z.string().optional(),
-}).strict();
+});
 
-const updateCitaSchema = citaBaseSchema.partial();
-const clienteSchema = z.object({ activo: z.boolean().optional(), solicitud_de_secretaría: z.boolean().optional() }).partial().strict();
-const doctorSchema = z.object({ nombre: z.string().min(3).optional(), especialidad: z.string().optional().nullable(), activo: z.boolean().optional(), horario_inicio: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional().nullable(), horario_fin: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional().nullable() }).strict();
-const updateDoctorSchema = doctorSchema.partial();
+// 5. RUTAS DE LA API
 
-// --- DEFINICIÓN DE ENDPOINTS (Envueltos en función de inicio) ---
-function startExpressServer() {
+// Health Check
+app.get('/', (req, res) => res.status(200).send(isReady ? 'Vintex Satellite: ONLINE' : 'Vintex Satellite: BOOTING...'));
 
-    // --- HEALTH CHECK ---
-    app.get('/', (req, res) => res.status(200).send('Vintex Clinic Backend (Fusión) - Operativo'));
+// LOGIN DEL PERSONAL (Contra tabla 'usuarios' local)
+app.post('/api/login', checkReady, async (req, res) => {
+    try {
+        const { email, password } = loginSchema.parse(req.body);
+        
+        // Buscar en DB Local
+        const { data: user, error } = await clinicSupabase
+            .from('usuarios')
+            .select('id, email, password_hash, rol, nombre')
+            .eq('email', email)
+            .single();
 
-    // --- LOGIN ---
-    app.post('/api/login', loginLimiter, async (req, res) => {
-        try {
-            const { email, password } = loginSchema.parse(req.body);
-            const { data: user, error } = await supabase
-                .from('usuarios')
-                .select('id, email, password_hash, rol')
-                .eq('email', email)
+        if (error || !user) return res.status(401).json({ error: 'Usuario no encontrado.' });
+
+        // Verificar contraseña
+        const validPass = await bcrypt.compare(password, user.password_hash);
+        if (!validPass) return res.status(401).json({ error: 'Contraseña incorrecta.' });
+
+        // Generar Token
+        const token = jwt.sign(
+            { id: user.id, email: user.email, rol: user.rol, nombre: user.nombre }, 
+            clinicJwtSecret, 
+            { expiresIn: '12h' }
+        );
+
+        res.json({ token, user: { id: user.id, email: user.email, rol: user.rol, nombre: user.nombre } });
+
+    } catch (e) {
+        if (e instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos' });
+        res.status(500).json({ error: e.message || 'Error interno' });
+    }
+});
+
+// OBTENER CITAS (Rango de fechas)
+app.get('/api/citas', checkReady, authenticateToken, async (req, res) => {
+    const { start, end } = req.query;
+    try {
+        let query = clinicSupabase
+            .from('citas')
+            .select(`
+                *,
+                cliente:clientes(id, nombre, dni, telefono),
+                doctor:doctores(id, nombre, especialidad, color)
+            `)
+            .order('fecha_hora', { ascending: true });
+
+        if (start && end) {
+            query = query.gte('fecha_hora', start).lte('fecha_hora', end);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// CREAR CITA (Con lógica de Paciente Nuevo)
+app.post('/api/citas', checkReady, authenticateToken, async (req, res) => {
+    try {
+        const body = nuevaCitaSchema.parse(req.body);
+        let clienteId = body.cliente_id;
+
+        // Si es paciente nuevo, crearlo primero
+        if (!clienteId && body.new_client_name) {
+            // Verificar duplicados por DNI primero
+            const { data: existing } = await clinicSupabase
+                .from('clientes')
+                .select('id')
+                .eq('dni', body.new_client_dni)
                 .single();
 
-            if (error || !user) return res.status(401).json({ error: 'Credenciales inválidas.' });
-
-            const isValid = await bcrypt.compare(password, user.password_hash);
-            if (!isValid) return res.status(401).json({ error: 'Credenciales inválidas.' });
-
-            const token = jwt.sign({ id: user.id, email: user.email, rol: user.rol }, JWT_SECRET, { expiresIn: '8h' });
-            res.status(200).json({ token, user: { id: user.id, email: user.email, rol: user.rol } });
-        } catch (error) {
-            if (error instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: error.errors });
-            res.status(500).json({ error: 'Error interno.' });
-        }
-    });
-
-    // --- DATOS INICIALES ---
-    app.get('/api/initial-data', authenticateToken, async (req, res) => {
-        try {
-            const [doctores, clientes, chatHistory] = await Promise.all([
-                supabase.from('doctores').select('*').order('nombre', { ascending: true }),
-                supabase.from('clientes').select('*').order('nombre', { ascending: true }),
-                supabase.from('n8n_chat_histories').select('*').order('id', { ascending: false }).limit(500)
-            ]);
-            if (doctores.error) throw doctores.error;
-            res.status(200).json({ doctors: doctores.data, clients: clientes.data, chatHistory: chatHistory.data });
-        } catch (error) {
-            res.status(500).json({ error: 'Error cargando datos.', details: error.message });
-        }
-    });
-
-    // --- CITAS (GET UNIFICADO) ---
-    app.get('/api/citas', authenticateToken, async (req, res) => {
-        const { start, end } = req.query;
-        try {
-            let query = supabase.from('citas').select(`
-                id, fecha_hora, descripcion, estado, duracion_minutos, timezone,
-                cliente:clientes (id, nombre, dni),
-                doctor:doctores (id, nombre, especialidad, activo, horario_inicio, horario_fin)
-            `).order('fecha_hora', { ascending: true });
-
-            if (start && end) {
-                const validatedQuery = citasRangeSchema.parse({ start, end });
-                query = query.gte('fecha_hora', validatedQuery.start).lte('fecha_hora', validatedQuery.end);
-            }
-            const { data, error } = await query;
-            if (error) throw error;
-            res.status(200).json(data);
-        } catch (error) {
-            if (error instanceof z.ZodError) return res.status(400).json({ error: 'Rango inválido', details: error.errors });
-            res.status(500).json({ error: 'Error obteniendo citas', details: error.message });
-        }
-    });
-
-    // --- CITAS (POST) ---
-    app.post('/api/citas', authenticateToken, async (req, res) => {
-        try {
-            const citaData = nuevaCitaSchema.parse(req.body);
-            let clienteId = citaData.cliente_id;
-
-            if (citaData.new_client_name && citaData.new_client_dni) {
-                const { data: newClient, error: clientError } = await supabase
+            if (existing) {
+                clienteId = existing.id; // Usar existente si el DNI coincide
+            } else {
+                const { data: newClient, error: clientError } = await clinicSupabase
                     .from('clientes')
-                    .insert({ nombre: citaData.new_client_name, dni: citaData.new_client_dni, telefono: citaData.new_client_telefono, activo: true, solicitud_de_secretaría: false })
-                    .select('id').single();
-                if (clientError) throw clientError;
+                    .insert({
+                        nombre: body.new_client_name,
+                        dni: body.new_client_dni,
+                        telefono: body.new_client_telefono || '',
+                        activo: true,
+                        solicitud_de_secretaria: false // Corrección de tilde
+                    })
+                    .select()
+                    .single();
+                
+                if (clientError) throw new Error(`Error creando paciente: ${clientError.message}`);
                 clienteId = newClient.id;
-            } else if (!clienteId) return res.status(400).json({ error: 'Falta cliente_id.' });
-
-            const { data: nuevaCita, error: citaError } = await supabase
-                .from('citas')
-                .insert({
-                    cliente_id: clienteId, doctor_id: citaData.doctor_id, fecha_hora: citaData.fecha_hora, timezone: citaData.timezone,
-                    descripcion: citaData.descripcion, duracion_minutos: citaData.duracion_minutos, estado: citaData.estado
-                })
-                .select('*, cliente:clientes(*), doctor:doctores(*)').single(); // Select simplificado para el ejemplo
-            if (citaError) throw citaError;
-            res.status(201).json(nuevaCita);
-        } catch (error) {
-            if (error instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: error.errors });
-            res.status(500).json({ error: 'Error creando cita', details: error.message });
+            }
         }
-    });
 
-    // --- CITAS (PATCH) ---
-    app.patch('/api/citas/:id', authenticateToken, async (req, res) => {
-        try {
-            const validatedId = idSchema.parse(Number(req.params.id));
-            const dataToUpdate = updateCitaSchema.parse(req.body);
-            const { data, error } = await supabase.from('citas').update(dataToUpdate).eq('id', validatedId).select().single();
-            if (error) throw error;
-            if (!data) return res.status(404).json({ error: 'No encontrada' });
-            res.status(200).json(data);
-        } catch (error) {
-            res.status(500).json({ error: 'Error actualizando', details: error.message });
-        }
-    });
+        if (!clienteId) throw new Error("Debe seleccionar un paciente o ingresar datos válidos.");
 
-    // --- CITAS (DELETE) ---
-    app.delete('/api/citas/:id', authenticateToken, async (req, res) => {
-        try {
-            const validatedId = idSchema.parse(Number(req.params.id));
-            const { error } = await supabase.from('citas').delete().eq('id', validatedId);
-            if (error) throw error;
-            res.status(204).send();
-        } catch (error) {
-            res.status(500).json({ error: 'Error eliminando', details: error.message });
-        }
-    });
+        // Crear la Cita
+        const { data: cita, error: citaError } = await clinicSupabase
+            .from('citas')
+            .insert({
+                doctor_id: body.doctor_id,
+                cliente_id: clienteId,
+                fecha_hora: body.fecha_hora,
+                duracion_minutos: body.duracion_minutos,
+                estado: body.estado,
+                descripcion: body.descripcion,
+                timezone: body.timezone
+            })
+            .select()
+            .single();
 
-    // --- CLIENTES & DOCTORES (PATCH/POST) - Resumido manteniendo lógica ---
-    app.patch('/api/clientes/:id', authenticateToken, async (req, res) => {
-        try {
-            const validatedId = idSchema.parse(Number(req.params.id));
-            const dataToUpdate = clienteSchema.parse(req.body);
-            const { data, error } = await supabase.from('clientes').update(dataToUpdate).eq('id', validatedId).select().single();
-            if (error) throw error;
-            res.status(200).json(data);
-        } catch (e) { res.status(500).json({ error: e.message }); }
-    });
+        if (citaError) throw citaError;
+        res.status(201).json(cita);
 
-    app.post('/api/doctores', authenticateToken, async (req, res) => {
-        try {
-            const dataToInsert = doctorSchema.parse(req.body);
-            const { data, error } = await supabase.from('doctores').insert(dataToInsert).select().single();
-            if (error) throw error;
-            res.status(201).json(data);
-        } catch (e) { res.status(500).json({ error: e.message }); }
-    });
+    } catch (e) {
+        const msg = e instanceof z.ZodError ? 'Datos inválidos' : e.message;
+        res.status(400).json({ error: msg, details: e });
+    }
+});
 
-    app.patch('/api/doctores/:id', authenticateToken, async (req, res) => {
-        try {
-            const validatedId = idSchema.parse(Number(req.params.id));
-            const dataToUpdate = updateDoctorSchema.parse(req.body);
-            const { data, error } = await supabase.from('doctores').update(dataToUpdate).eq('id', validatedId).select().single();
-            if (error) throw error;
-            res.status(200).json(data);
-        } catch (e) { res.status(500).json({ error: e.message }); }
-    });
+// DATOS INICIALES (Doctores y Pacientes para selects)
+app.get('/api/initial-data', checkReady, authenticateToken, async (req, res) => {
+    try {
+        const [doctores, clientes] = await Promise.all([
+            clinicSupabase.from('doctores').select('*').eq('activo', true),
+            clinicSupabase.from('clientes').select('*').eq('activo', true).limit(500) // Limitar para rendimiento
+        ]);
+        
+        res.json({ 
+            doctors: doctores.data || [], 
+            clients: clientes.data || [] 
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
 
-    // --- INICIO DEL SERVIDOR EXPRESS ---
-    app.listen(PORT, () => {
-        console.log(`\n🚀 SERVIDOR VINTEX (FUSIÓN) ACTIVO EN PUERTO ${PORT}`);
-        console.log(`   - Modo: Satélite (Configuración dinámica desde Master)`);
-        console.log(`   - ID Clínica: ${CLINIC_USER_ID}`);
-    });
-}
-
-// 3. EJECUTAR ARRANQUE
-bootServer();
+// --- INICIAR SERVIDOR ---
+app.listen(PORT, () => {
+    console.log(`🚀 Servidor Satélite escuchando en puerto ${PORT}`);
+    bootServer(); // Arrancar lógica de conexión
+});
