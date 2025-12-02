@@ -25,6 +25,7 @@
     "express-rate-limit": "^7.5.1",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "lru-cache": "^11.2.4",
     "zod": "^3.25.76"
   }
 }

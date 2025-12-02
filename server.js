@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { rateLimit } = require('express-rate-limit');
 const helmet = require('helmet');
 const { z } = require('zod');
+const { LRUCache } = require('lru-cache'); // REQUIERE: npm install lru-cache
 
 const app = express();
 app.set('trust proxy', 1);
@@ -13,7 +14,6 @@ const PORT = process.env.PORT || 3002;
 // Variables de entorno
 const MASTER_URL = process.env.MASTER_SUPABASE_URL;
 const MASTER_KEY = process.env.MASTER_SUPABASE_SERVICE_KEY;
-// URL DEL FRONTEND (Asegúrate de poner la URL real)
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://tu-dominio-frontend.com";
 
 if (!MASTER_URL || !MASTER_KEY) {
@@ -25,28 +25,52 @@ const masterClient = createClient(MASTER_URL, MASTER_KEY, {
     auth: { autoRefreshToken: false, persistSession: false }
 });
 
-// --- 1. SEGURIDAD ---
+// --- 1. SEGURIDAD: HEADERS & CORS ---
 app.use(helmet());
+// Evitar cacheo de respuestas sensibles (Fase 2 Fix)
+app.use((req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+});
+
 app.use(cors({
     origin: [FRONTEND_URL, 'http://localhost:5173'],
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+// DoS Protection: Límite estricto de body
 app.use(express.json({ limit: '10kb' }));
 
 // Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
-    limit: 150, // Un poco más alto para el satélite que tiene tráfico de uso intenso
+    limit: 150, 
     message: { error: "Límite de peticiones excedido." }
 });
 app.use(limiter);
 
-// --- 2. CACHÉ CREDENCIALES ---
-const credentialCache = new Map(); 
-const CACHE_TTL = 1000 * 60 * 5; 
+// --- 2. GESTIÓN DE MEMORIA SEGURA (Fase 2 Fix) ---
+// Reemplazamos el Map nativo por LRU Cache para evitar fugas de memoria
+const credentialCache = new LRUCache({
+    max: 500, // Máximo 500 conexiones en memoria
+    ttl: 1000 * 60 * 5, // 5 minutos de vida
+    updateAgeOnGet: false,
+});
 
-// --- 3. MIDDLEWARE MULTI-TENANT ---
+// --- 3. SANITIZACIÓN (CSV/Formula Injection Fix) ---
+const sanitizeInput = (text) => {
+    if (typeof text !== 'string') return text;
+    // Si empieza con caracteres peligrosos para Excel/CSV, neutralizarlos
+    if (/^[=+\-@]/.test(text)) {
+        return `'${text}`; 
+    }
+    return text;
+};
+
+// --- 4. MIDDLEWARE MULTI-TENANT ---
 const dynamicDbMiddleware = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -64,9 +88,7 @@ const dynamicDbMiddleware = async (req, res, next) => {
 
         let clinicConfig = credentialCache.get(user.id);
         
-        if (!clinicConfig || (Date.now() - clinicConfig.timestamp > CACHE_TTL)) {
-            // console.log(`🔄 Resolviendo conexión para: ${user.id}`); // Debug seguro
-            
+        if (!clinicConfig) {
             const { data, error: dbError } = await masterClient
                 .from('web_clinica')
                 .select('SUPABASE_URL, SUPABASE_SERVICE_KEY')
@@ -80,7 +102,6 @@ const dynamicDbMiddleware = async (req, res, next) => {
             clinicConfig = {
                 url: data.SUPABASE_URL,
                 key: data.SUPABASE_SERVICE_KEY,
-                timestamp: Date.now()
             };
             credentialCache.set(user.id, clinicConfig);
         }
@@ -97,27 +118,20 @@ const dynamicDbMiddleware = async (req, res, next) => {
     }
 };
 
-// --- 4. ESQUEMAS ZOD ---
+// --- 5. ESQUEMAS ZOD ---
 const citaSchema = z.object({
     doctor_id: z.number(),
     cliente_id: z.number().optional().nullable(),
-    fecha_hora: z.string().datetime(), // Valida formato ISO
+    fecha_hora: z.string().datetime(), 
     duracion_minutos: z.number().min(5).max(240),
     estado: z.string(),
     descripcion: z.string().optional().nullable(),
     timezone: z.string().optional(),
-    // Para paciente nuevo
     new_client_name: z.string().min(2).optional(),
     new_client_dni: z.string().optional(),
     new_client_telefono: z.string().optional()
 });
 
-const clienteUpdateSchema = z.object({
-    activo: z.boolean().optional(),
-    solicitud_de_secretaria: z.boolean().optional()
-});
-
-// Middleware Validación
 const validate = (schema) => (req, res, next) => {
     try {
         schema.parse(req.body);
@@ -129,7 +143,6 @@ const validate = (schema) => (req, res, next) => {
 
 // --- RUTAS ---
 
-// DATA INICIAL
 app.get('/api/initial-data', dynamicDbMiddleware, async (req, res) => {
     try {
         const [docs, clients] = await Promise.all([
@@ -138,12 +151,10 @@ app.get('/api/initial-data', dynamicDbMiddleware, async (req, res) => {
         ]);
         res.json({ doctores: docs.data, clientes: clients.data });
     } catch (e) { 
-        console.error(e);
-        res.status(500).json({ error: 'Error obteniendo datos iniciales.' }); 
+        res.status(500).json({ error: 'Error obteniendo datos.' }); 
     }
 });
 
-// CITAS
 app.get('/api/citas', dynamicDbMiddleware, async (req, res) => {
     const { start, end } = req.query;
     try {
@@ -157,23 +168,38 @@ app.get('/api/citas', dynamicDbMiddleware, async (req, res) => {
         if (error) throw error;
         res.json(data);
     } catch (e) { 
-        console.error(e);
         res.status(500).json({ error: 'Error cargando citas.' }); 
     }
 });
 
+// POST Citas: Con Race Condition Check + Sanitización
 app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, res) => {
     try {
         const body = req.body;
+        
+        // 1. Race Condition Fix (Verificación preventiva en Backend)
+        const { data: existing } = await req.clinicClient.from('citas')
+            .select('id')
+            .eq('doctor_id', body.doctor_id)
+            .eq('fecha_hora', body.fecha_hora)
+            .neq('estado', 'cancelada') 
+            .single();
+
+        if (existing) {
+            return res.status(409).json({ error: "El horario ya está ocupado." });
+        }
+
         let clienteId = body.cliente_id;
 
         if (!clienteId && body.new_client_name) {
-            // Crear cliente con validación básica implícita por el backend anterior
+            // CSV Injection Fix: Sanitizar nombre
+            const safeName = sanitizeInput(body.new_client_name);
+            
             const { data: newClient, error: cErr } = await req.clinicClient.from('clientes')
                 .insert({
-                    nombre: body.new_client_name,
-                    dni: body.new_client_dni || '',
-                    telefono: body.new_client_telefono || '',
+                    nombre: safeName,
+                    dni: sanitizeInput(body.new_client_dni || ''),
+                    telefono: sanitizeInput(body.new_client_telefono || ''),
                     activo: true,
                     solicitud_de_secretaría: false 
                 }).select().single();
@@ -188,11 +214,15 @@ app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, re
             fecha_hora: body.fecha_hora,
             duracion_minutos: body.duracion_minutos,
             estado: body.estado,
-            descripcion: body.descripcion,
+            descripcion: sanitizeInput(body.descripcion), // Sanitizar descripción
             timezone: body.timezone
         }).select().single();
 
-        if (error) throw error;
+        if (error) {
+            // Manejo de error si la DB rechaza por índice único (Doble seguridad)
+            if (error.code === '23505') return res.status(409).json({ error: "Horario ocupado (DB)." });
+            throw error;
+        }
         res.status(201).json({ ...data, new_client_id: clienteId });
     } catch (e) { 
         console.error(e);
@@ -200,14 +230,34 @@ app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, re
     }
 });
 
+// PATCH Citas: Mass Assignment Fix (Whitelist)
 app.patch('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
-    // Nota: Deberías hacer un schema para updatePartial si quieres ser estricto
     try {
+        // Definir qué campos se pueden actualizar
+        const allowedSchema = z.object({
+            estado: z.enum(['programada', 'confirmada', 'cancelada', 'completada', 'no_asistio']).optional(),
+            descripcion: z.string().optional(),
+            duracion_minutos: z.number().min(5).max(240).optional(),
+            fecha_hora: z.string().datetime().optional()
+        });
+
+        // Filtrar y validar el body (Mass Assignment Fix)
+        const safeData = allowedSchema.parse(req.body);
+
+        if (safeData.descripcion) {
+            safeData.descripcion = sanitizeInput(safeData.descripcion);
+        }
+
         const { data, error } = await req.clinicClient.from('citas')
-            .update(req.body).eq('id', req.params.id).select().single();
+            .update(safeData) // Usamos safeData, NO req.body directo
+            .eq('id', req.params.id).select().single();
+            
         if (error) throw error;
         res.json(data);
-    } catch (e) { res.status(500).json({ error: 'Error actualizando cita.' }); }
+    } catch (e) { 
+        if (e instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: e.errors });
+        res.status(500).json({ error: 'Error actualizando cita.' }); 
+    }
 });
 
 app.delete('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
@@ -218,37 +268,44 @@ app.delete('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error eliminando cita.' }); }
 });
 
-// CLIENTES
-app.patch('/api/clientes/:id', dynamicDbMiddleware, validate(clienteUpdateSchema), async (req, res) => {
+// PATCH Clientes: Mass Assignment Fix + CSV Fix
+app.patch('/api/clientes/:id', dynamicDbMiddleware, async (req, res) => {
     try {
-        const { activo, solicitud_de_secretaria } = req.body;
-        const updates = {};
-        if (typeof activo === 'boolean') updates.activo = activo;
-        if (typeof solicitud_de_secretaria === 'boolean') updates.solicitud_de_secretaría = solicitud_de_secretaria;
+        const clientUpdateSchema = z.object({
+            activo: z.boolean().optional(),
+            solicitud_de_secretaria: z.boolean().optional(),
+            nombre: z.string().min(2).optional(),
+            telefono: z.string().optional(),
+            dni: z.string().optional()
+        });
+
+        const safeData = clientUpdateSchema.parse(req.body);
+        
+        // Sanitizar strings si existen
+        ['nombre', 'telefono', 'dni'].forEach(field => {
+            if (safeData[field]) safeData[field] = sanitizeInput(safeData[field]);
+        });
 
         const { data, error } = await req.clinicClient.from('clientes')
-            .update(updates).eq('id', req.params.id).select().single();
+            .update(safeData)
+            .eq('id', req.params.id).select().single();
         
         if (error) throw error;
         res.json(data);
     } catch (e) { res.status(500).json({ error: 'Error actualizando cliente.' }); }
 });
 
-// FILES & CHAT (CORREGIDO: Sanitización en subida de archivos)
+// FILES: Path Traversal Fix (De Fase 1)
 app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res) => {
     try {
         const { fileName, clienteId } = req.body;
         
-        // Validación estricta de inputs
         if(!fileName || !clienteId || typeof fileName !== 'string') {
             return res.status(400).json({error: "Datos inválidos"});
         }
 
-        // CORRECCIÓN: Sanitización de nombre de archivo para evitar Path Traversal
-        // Solo permite letras, números, puntos, guiones y guiones bajos.
+        // Sanitización estricta de Path Traversal
         const safeFileName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-        
-        // CORRECCIÓN: Aseguramos que clienteId sea numérico/string seguro
         const safeClientId = String(clienteId).replace(/[^0-9]/g, '');
 
         const filePath = `${safeClientId}/${Date.now()}_${safeFileName}`;
@@ -260,11 +317,12 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
         if (error) throw error;
         res.json({ signedUrl: data.signedUrl, path: data.path });
     } catch (e) { 
-        console.error("File Upload Error:", e);
-        res.status(500).json({ error: 'Error generando URL de subida.' }); 
+        res.status(500).json({ error: 'Error generando URL.' }); 
     }
 });
 
+// El resto de rutas de archivos y chat se mantienen igual que en Fase 1, 
+// ya que son lecturas simples y están protegidas por el middleware.
 app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     try {
         const { clienteId, storagePath, fileName, fileType, fileSizeKB } = req.body;
@@ -275,7 +333,6 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
             file_type: fileType,
             file_size_kb: fileSizeKB
         }).select().single();
-
         if (error) throw error;
         res.status(201).json(data);
     } catch (e) { res.status(500).json({ error: 'Error registrando archivo.' }); }
@@ -294,15 +351,11 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, async (req, res) => 
     try {
         const phone = req.params.telefono.replace(/\D/g, ''); 
         if (!phone) return res.json([]);
-
         const { data, error } = await req.clinicClient.from('n8n_chat_histories')
-            .select('*')
-            .ilike('session_id', `%${phone}%`)
-            .order('id', { ascending: true });
-            
+            .select('*').ilike('session_id', `%${phone}%`).order('id', { ascending: true });
         if (error) throw error;
         res.json(data);
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE Operativo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE+ Operativo en puerto ${PORT}`));
