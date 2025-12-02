@@ -234,21 +234,35 @@ app.patch('/api/clientes/:id', dynamicDbMiddleware, validate(clienteUpdateSchema
     } catch (e) { res.status(500).json({ error: 'Error actualizando cliente.' }); }
 });
 
-// FILES & CHAT (Sin cambios mayores de lógica, solo protegidos por middleware)
+// FILES & CHAT (CORREGIDO: Sanitización en subida de archivos)
 app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res) => {
     try {
         const { fileName, clienteId } = req.body;
-        // Validación básica manual (Zod sería mejor)
-        if(!fileName || !clienteId) return res.status(400).json({error: "Faltan datos"});
+        
+        // Validación estricta de inputs
+        if(!fileName || !clienteId || typeof fileName !== 'string') {
+            return res.status(400).json({error: "Datos inválidos"});
+        }
 
-        const filePath = `${clienteId}/${Date.now()}_${fileName.replace(/\s+/g, '_')}`;
+        // CORRECCIÓN: Sanitización de nombre de archivo para evitar Path Traversal
+        // Solo permite letras, números, puntos, guiones y guiones bajos.
+        const safeFileName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+        
+        // CORRECCIÓN: Aseguramos que clienteId sea numérico/string seguro
+        const safeClientId = String(clienteId).replace(/[^0-9]/g, '');
+
+        const filePath = `${safeClientId}/${Date.now()}_${safeFileName}`;
+        
         const { data, error } = await req.clinicClient.storage
             .from('adjuntos') 
             .createSignedUploadUrl(filePath, 60 * 10);
 
         if (error) throw error;
         res.json({ signedUrl: data.signedUrl, path: data.path });
-    } catch (e) { res.status(500).json({ error: 'Error de almacenamiento.' }); }
+    } catch (e) { 
+        console.error("File Upload Error:", e);
+        res.status(500).json({ error: 'Error generando URL de subida.' }); 
+    }
 });
 
 app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
