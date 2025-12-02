@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 app.set('trust proxy', 1);
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3002;
 
 // Variables de entorno
 const MASTER_URL = process.env.MASTER_SUPABASE_URL;
