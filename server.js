@@ -16,6 +16,33 @@ const CLINIC_USER_ID = process.env.CLINIC_USER_ID;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// --- LOGGER MIDDLEWARE (NUEVO) ---
+// Muestra peticiones y respuestas en consola para depuración
+app.use((req, res, next) => {
+    // 1. Loguear la petición (Request)
+    console.log(`\n🔵 [REQUEST] ${req.method} ${req.url}`);
+    if (req.body && Object.keys(req.body).length > 0) {
+        console.log('   Payload:', JSON.stringify(req.body, null, 2));
+    } else {
+        console.log('   Payload: (vacío)');
+    }
+
+    // 2. Interceptar la respuesta (Response)
+    const originalJson = res.json;
+    res.json = function (body) {
+        console.log(`fq [RESPONSE] Status: ${res.statusCode}`);
+        if (body) {
+            // Opcional: Si la respuesta es muy larga (ej. lista de citas), 
+            // puedes comentar la siguiente línea para no saturar la consola.
+            console.log('   Body:', JSON.stringify(body, null, 2));
+        }
+        return originalJson.call(this, body);
+    };
+
+    next();
+});
+// ---------------------------------
+
 // Estado del servidor
 let supabase; 
 let JWT_SECRET;
@@ -32,7 +59,7 @@ async function bootServer() {
     try {
         const masterClient = createClient(MASTER_URL, MASTER_KEY);
         
-        // Obtener credenciales
+        // Obtener credenciales desde la DB Maestra
         const { data, error } = await masterClient
             .from('web_clinica')
             .select('SUPABASE_URL, SUPABASE_SERVICE_KEY, JWT_SECRET')
@@ -49,14 +76,15 @@ async function bootServer() {
         console.log("✅ Satélite CONECTADO a DB Clínica.");
     } catch (err) {
         console.error("❌ Fallo de arranque:", err.message);
+        console.log("Reintentando en 10 segundos...");
         setTimeout(bootServer, 10000); 
     }
 }
 bootServer();
 
-// --- MIDDLEWARES ---
+// --- MIDDLEWARES DE SEGURIDAD ---
 const checkReady = (req, res, next) => {
-    if (!isReady) return res.status(503).json({ error: 'Servidor iniciando...' });
+    if (!isReady) return res.status(503).json({ error: 'Servidor iniciando, intente nuevamente en unos segundos...' });
     next();
 };
 
@@ -66,7 +94,7 @@ const authenticateToken = (req, res, next) => {
     if (!token) return res.status(401).json({ error: 'Token requerido' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Token inválido' });
+        if (err) return res.status(403).json({ error: 'Token inválido o expirado' });
         req.user = user;
         next();
     });
@@ -114,7 +142,7 @@ app.post('/api/citas', checkReady, authenticateToken, async (req, res) => {
                     dni: body.new_client_dni || '',
                     telefono: body.new_client_telefono || '',
                     activo: true,
-                    solicitud_de_secretaría: false
+                    solicitud_de_secretaria: false // Asumimos sin acento en DB
                 }).select().single();
             
             if (cErr) throw cErr;
@@ -132,6 +160,8 @@ app.post('/api/citas', checkReady, authenticateToken, async (req, res) => {
         }).select().single();
 
         if (error) throw error;
+        
+        // Devolvemos la cita creada y el ID del cliente nuevo (si hubo)
         res.status(201).json({ ...data, new_client_id: clienteId });
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
@@ -157,6 +187,7 @@ app.patch('/api/clientes/:id', checkReady, authenticateToken, async (req, res) =
     try {
         const { activo, solicitud_de_secretaria } = req.body;
         const updates = {};
+        
         // Solo actualizamos lo que viene en el body
         if (typeof activo === 'boolean') updates.activo = activo;
         if (typeof solicitud_de_secretaria === 'boolean') updates.solicitud_de_secretaria = solicitud_de_secretaria;
@@ -172,12 +203,12 @@ app.patch('/api/clientes/:id', checkReady, authenticateToken, async (req, res) =
 // 4. STORAGE (Archivos Adjuntos)
 app.post('/api/files/generate-upload-url', checkReady, authenticateToken, async (req, res) => {
     try {
-        const { fileName, fileType, clienteId } = req.body;
+        const { fileName, clienteId } = req.body;
         // Estructura: ID_CLIENTE / TIMESTAMP_NOMBRE
         const filePath = `${clienteId}/${Date.now()}_${fileName.replace(/\s+/g, '_')}`;
         
         const { data, error } = await supabase.storage
-            .from('adjuntos') // IMPORTANTE: Crear este bucket en Supabase como público o privado autenticado
+            .from('adjuntos') 
             .createSignedUploadUrl(filePath, 60 * 10); // 10 minutos de validez
 
         if (error) throw error;
@@ -193,9 +224,7 @@ app.post('/api/files/confirm-upload', checkReady, authenticateToken, async (req,
             storage_path: storagePath,
             file_name: fileName,
             file_type: fileType,
-            file_size_kb: fileSizeKB,
-            // Asumimos que podemos obtener el ID del usuario del token si está en la tabla users
-            // subido_por_admin_id: req.user.sub 
+            file_size_kb: fileSizeKB
         }).select().single();
 
         if (error) throw error;
@@ -215,13 +244,13 @@ app.get('/api/files/:clienteId', checkReady, authenticateToken, async (req, res)
 // 5. HISTORIAL DE CHAT
 app.get('/api/chat-history/:telefono', checkReady, authenticateToken, async (req, res) => {
     try {
-        // Normalizamos el teléfono (quitamos símbolos)
+        // Normalizamos el teléfono (quitamos símbolos para buscar mejor)
         const phone = req.params.telefono.replace(/\D/g, ''); 
         if (!phone) return res.json([]);
 
         const { data, error } = await supabase.from('n8n_chat_histories')
             .select('*')
-            .ilike('session_id', `%${phone}%`) // Búsqueda flexible
+            .ilike('session_id', `%${phone}%`) // Búsqueda flexible por si el ID incluye código país
             .order('id', { ascending: true });
             
         if (error) throw error;
@@ -229,4 +258,4 @@ app.get('/api/chat-history/:telefono', checkReady, authenticateToken, async (req
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`🚀 Satélite Operativo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite Operativo en puerto ${PORT}`));
