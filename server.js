@@ -28,6 +28,7 @@ const masterClient = createClient(MASTER_URL, MASTER_KEY, {
 // --- 1. SEGURIDAD: HEADERS & CORS ---
 app.use(helmet());
 app.use((req, res, next) => {
+    // Evita caché en respuestas API para proteger datos médicos
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
@@ -37,10 +38,11 @@ app.use((req, res, next) => {
 app.use(cors({
     origin: [FRONTEND_URL, 'http://localhost:5173'],
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-owner-id'], // Agregamos x-owner-id para staff
+    credentials: true
 }));
 
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '10kb' })); // Previene DoS por payload grande
 
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
@@ -56,7 +58,7 @@ const credentialCache = new LRUCache({
     updateAgeOnGet: false,
 });
 
-// --- 3. SANITIZACIÓN ---
+// --- 3. SANITIZACIÓN (CSV Injection) ---
 const sanitizeInput = (text) => {
     if (typeof text !== 'string') return text;
     if (/^[=+\-@]/.test(text)) {
@@ -65,14 +67,18 @@ const sanitizeInput = (text) => {
     return text;
 };
 
-// --- 4. MIDDLEWARE MULTI-TENANT ---
+// --- 4. MIDDLEWARE MULTI-TENANT (CORREGIDO Lógica Staff) ---
 const dynamicDbMiddleware = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
+    
+    // Header opcional para cuando un Staff accede a la clínica de un Dueño
+    const targetOwnerId = req.headers['x-owner-id']; 
 
     if (!token) return res.status(401).json({ error: 'Token requerido' });
 
     try {
+        // 1. Validar Token en Master
         const { data: { user }, error: authError } = await masterClient.auth.getUser(token);
 
         if (authError || !user) {
@@ -81,29 +87,55 @@ const dynamicDbMiddleware = async (req, res, next) => {
 
         req.user = user;
 
-        let clinicConfig = credentialCache.get(user.id);
+        // 2. Determinar el ID del Dueño de la Clínica a conectar
+        // Si mandan x-owner-id, intentamos conectar a esa clínica (Caso Staff).
+        // Si no, asumimos que el usuario logueado es el dueño (Caso Admin).
+        const clinicOwnerId = targetOwnerId || user.id;
+
+        // 3. Buscar Credenciales (con Caché)
+        let clinicConfig = credentialCache.get(clinicOwnerId);
         
         if (!clinicConfig) {
             const { data, error: dbError } = await masterClient
                 .from('web_clinica')
                 .select('SUPABASE_URL, SUPABASE_SERVICE_KEY')
-                .eq('ID_USER', user.id)
+                .eq('ID_USER', clinicOwnerId) // Buscamos por el ID del dueño
                 .single();
 
             if (dbError || !data) {
-                return res.status(404).json({ error: 'Configuración de clínica no encontrada.' });
+                return res.status(404).json({ error: 'Clínica no encontrada o no configurada.' });
             }
 
             clinicConfig = {
                 url: data.SUPABASE_URL,
                 key: data.SUPABASE_SERVICE_KEY,
             };
-            credentialCache.set(user.id, clinicConfig);
+            credentialCache.set(clinicOwnerId, clinicConfig);
         }
 
+        // 4. Conectar a la BD Satélite
         req.clinicClient = createClient(clinicConfig.url, clinicConfig.key, {
             auth: { autoRefreshToken: false, persistSession: false }
         });
+
+        // 5. VERIFICACIÓN DE PERTENENCIA (Crucial para seguridad Staff)
+        // Si el usuario logueado NO es el dueño, debemos verificar que sea Staff en esa BD
+        if (user.id !== clinicOwnerId) {
+            const { data: staffMember, error: staffError } = await req.clinicClient
+                .from('perfil_staff')
+                .select('id, rol')
+                .eq('email', user.email) // Validamos por email
+                .single();
+
+            if (staffError || !staffMember) {
+                console.warn(`[ACCESO ILEGAL] Usuario ${user.email} intentó acceder a clínica de ${clinicOwnerId}`);
+                return res.status(403).json({ error: 'No tienes permisos de Staff en esta clínica.' });
+            }
+            // Opcional: inyectar el rol detectado para usarlo después
+            req.userRole = staffMember.rol; 
+        } else {
+            req.userRole = 'admin'; // El dueño es admin supremo
+        }
 
         next();
 
@@ -113,28 +145,27 @@ const dynamicDbMiddleware = async (req, res, next) => {
     }
 };
 
-// --- NUEVO: MIDDLEWARE DE CONTROL DE ROLES (RBAC) ---
-// Este middleware verifica que el usuario tenga el rol adecuado en la tabla 'perfil_staff'
+// --- MIDDLEWARE RBAC (Control de Roles) ---
 const requireRole = (allowedRoles) => async (req, res, next) => {
     try {
-        const email = req.user.email;
-        
-        // Consultamos la tabla de staff de la clínica conectada
-        const { data: staff, error } = await req.clinicClient
-            .from('perfil_staff')
-            .select('rol')
-            .eq('email', email)
-            .single();
+        // Usamos el rol ya resuelto en dynamicDbMiddleware para ahorrar una consulta
+        // Si no se resolvió (ej. es el dueño), volvemos a consultar o asumimos admin.
+        let rol = req.userRole;
 
-        // Si hay error, no existe el staff, o el rol no coincide con los permitidos
-        if (error || !staff || !allowedRoles.includes(staff.rol)) {
-            console.warn(`[SEGURIDAD] Acceso denegado a ${email}. Rol requerido: ${allowedRoles.join(', ')}`);
-            return res.status(403).json({ error: 'No tienes permisos suficientes para realizar esta acción.' });
+        if (!rol) {
+             const { data: staff } = await req.clinicClient
+                .from('perfil_staff')
+                .select('rol')
+                .eq('email', req.user.email)
+                .single();
+             rol = staff ? staff.rol : 'admin'; // Fallback a admin si es dueño
         }
 
+        if (!allowedRoles.includes(rol)) {
+            return res.status(403).json({ error: 'Permisos insuficientes.' });
+        }
         next();
     } catch (e) {
-        console.error("Error RBAC:", e);
         res.status(500).json({ error: 'Error verificando permisos.' });
     }
 };
@@ -153,6 +184,12 @@ const citaSchema = z.object({
     new_client_telefono: z.string().optional()
 });
 
+// Validación para Query Params (GET /citas)
+const queryCitasSchema = z.object({
+    start: z.string().datetime().optional(),
+    end: z.string().datetime().optional()
+});
+
 const validate = (schema) => (req, res, next) => {
     try {
         schema.parse(req.body);
@@ -164,11 +201,14 @@ const validate = (schema) => (req, res, next) => {
 
 // --- RUTAS ---
 
-// Definimos roles comunes
 const STAFF_ROLES = ['admin', 'secretaria', 'doctor'];
-const ADMIN_ROLES = ['admin', 'secretaria']; // Doctores excluidos de borrado/gestión crítica
+const ADMIN_ROLES = ['admin', 'secretaria'];
 
-app.get('/api/initial-data', dynamicDbMiddleware, async (req, res) => {
+// GET Data Inicial - Protegido con RBAC
+app.get('/api/initial-data', 
+    dynamicDbMiddleware, 
+    requireRole(STAFF_ROLES), 
+    async (req, res) => {
     try {
         const [docs, clients] = await Promise.all([
             req.clinicClient.from('doctores').select('*').eq('activo', true),
@@ -180,9 +220,15 @@ app.get('/api/initial-data', dynamicDbMiddleware, async (req, res) => {
     }
 });
 
-app.get('/api/citas', dynamicDbMiddleware, async (req, res) => {
-    const { start, end } = req.query;
+// GET Citas - Protegido con RBAC + Validación Query Params
+app.get('/api/citas', 
+    dynamicDbMiddleware, 
+    requireRole(STAFF_ROLES), 
+    async (req, res) => {
     try {
+        // Validación de inputs GET
+        const { start, end } = queryCitasSchema.parse(req.query);
+        
         let query = req.clinicClient.from('citas')
             .select(`*, cliente:clientes(id, nombre, telefono, dni), doctor:doctores(id, nombre, color)`)
             .order('fecha_hora', { ascending: true });
@@ -193,20 +239,20 @@ app.get('/api/citas', dynamicDbMiddleware, async (req, res) => {
         if (error) throw error;
         res.json(data);
     } catch (e) { 
+        if (e instanceof z.ZodError) return res.status(400).json({ error: 'Parámetros de fecha inválidos' });
         res.status(500).json({ error: 'Error cargando citas.' }); 
     }
 });
 
-// POST Citas: RBAC + Race Condition Fix + Sanitización
+// POST Citas
 app.post('/api/citas', 
     dynamicDbMiddleware, 
-    requireRole(STAFF_ROLES), // <--- PROTECCIÓN DE ROL
+    requireRole(STAFF_ROLES), 
     validate(citaSchema), 
     async (req, res) => {
     try {
         const body = req.body;
-        
-        // Race Condition Fix
+        // Race Condition Check
         const { data: existing } = await req.clinicClient.from('citas')
             .select('id')
             .eq('doctor_id', body.doctor_id)
@@ -214,16 +260,12 @@ app.post('/api/citas',
             .neq('estado', 'cancelada') 
             .single();
 
-        if (existing) {
-            return res.status(409).json({ error: "El horario ya está ocupado." });
-        }
+        if (existing) return res.status(409).json({ error: "Horario ocupado." });
 
         let clienteId = body.cliente_id;
 
         if (!clienteId && body.new_client_name) {
-            // CSV Injection Fix
             const safeName = sanitizeInput(body.new_client_name);
-            
             const { data: newClient, error: cErr } = await req.clinicClient.from('clientes')
                 .insert({
                     nombre: safeName,
@@ -232,7 +274,6 @@ app.post('/api/citas',
                     activo: true,
                     solicitud_de_secretaría: false 
                 }).select().single();
-            
             if (cErr) throw cErr;
             clienteId = newClient.id;
         }
@@ -253,15 +294,14 @@ app.post('/api/citas',
         }
         res.status(201).json({ ...data, new_client_id: clienteId });
     } catch (e) { 
-        console.error(e);
         res.status(400).json({ error: 'Error al crear la cita.' }); 
     }
 });
 
-// PATCH Citas: RBAC + Mass Assignment Fix
+// PATCH Citas
 app.patch('/api/citas/:id', 
     dynamicDbMiddleware, 
-    requireRole(STAFF_ROLES), // <--- PROTECCIÓN DE ROL
+    requireRole(STAFF_ROLES), 
     async (req, res) => {
     try {
         const allowedSchema = z.object({
@@ -272,33 +312,29 @@ app.patch('/api/citas/:id',
         });
 
         const safeData = allowedSchema.parse(req.body);
-
-        if (safeData.descripcion) {
-            safeData.descripcion = sanitizeInput(safeData.descripcion);
-        }
+        if (safeData.descripcion) safeData.descripcion = sanitizeInput(safeData.descripcion);
 
         const { data, error } = await req.clinicClient.from('citas')
-            .update(safeData)
-            .eq('id', req.params.id).select().single();
+            .update(safeData).eq('id', req.params.id).select().single();
             
         if (error) throw error;
         res.json(data);
     } catch (e) { 
-        if (e instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos', details: e.errors });
-        res.status(500).json({ error: 'Error actualizando cita.' }); 
+        if (e instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos' });
+        res.status(500).json({ error: 'Error actualizando.' }); 
     }
 });
 
-// DELETE Citas: CRÍTICO - Solo Admin/Secretaria
+// DELETE Citas - Solo Admin/Secretaria
 app.delete('/api/citas/:id', 
     dynamicDbMiddleware, 
-    requireRole(ADMIN_ROLES), // <--- ROL ESTRICTO
+    requireRole(ADMIN_ROLES), 
     async (req, res) => {
     try {
         const { error } = await req.clinicClient.from('citas').delete().eq('id', req.params.id);
         if (error) throw error;
         res.status(204).send();
-    } catch (e) { res.status(500).json({ error: 'Error eliminando cita.' }); }
+    } catch (e) { res.status(500).json({ error: 'Error eliminando.' }); }
 });
 
 // PATCH Clientes
@@ -314,39 +350,35 @@ app.patch('/api/clientes/:id',
             telefono: z.string().optional(),
             dni: z.string().optional()
         });
-
         const safeData = clientUpdateSchema.parse(req.body);
-        
-        ['nombre', 'telefono', 'dni'].forEach(field => {
-            if (safeData[field]) safeData[field] = sanitizeInput(safeData[field]);
-        });
+        ['nombre', 'telefono', 'dni'].forEach(k => { if(safeData[k]) safeData[k] = sanitizeInput(safeData[k]); });
 
         const { data, error } = await req.clinicClient.from('clientes')
-            .update(safeData)
-            .eq('id', req.params.id).select().single();
-        
+            .update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
         res.json(data);
     } catch (e) { res.status(500).json({ error: 'Error actualizando cliente.' }); }
 });
 
-// FILES: Path Traversal Fix
+// FILES: Generar URL (CORRECCIÓN CRÍTICA: Anti-Spoofing en Descarga)
 app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res) => {
     try {
         const { fileName, clienteId } = req.body;
-        
-        if(!fileName || !clienteId || typeof fileName !== 'string') {
-            return res.status(400).json({error: "Datos inválidos"});
-        }
+        if(!fileName || !clienteId) return res.status(400).json({error: "Datos inválidos"});
 
+        // Path Traversal Mitigation
         const safeFileName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
         const safeClientId = String(clienteId).replace(/[^0-9]/g, '');
-
         const filePath = `${safeClientId}/${Date.now()}_${safeFileName}`;
         
+        // 🔥 SOLUCIÓN CRÍTICA: download: true
+        // Esto agrega 'Content-Disposition: attachment' obligando al navegador a descargar el archivo.
+        // Impide que un HTML/SVG malicioso se ejecute en el contexto de la aplicación.
         const { data, error } = await req.clinicClient.storage
             .from('adjuntos') 
-            .createSignedUploadUrl(filePath, 60 * 10);
+            .createSignedUploadUrl(filePath, 60 * 10, {
+                download: true 
+            });
 
         if (error) throw error;
         res.json({ signedUrl: data.signedUrl, path: data.path });
@@ -355,15 +387,13 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
     }
 });
 
-// FILES: Confirm Upload (Protección de Integridad / Anti-Spoofing)
+// FILES: Confirmar Subida (Validación de Integridad)
 app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     try {
         const { clienteId, storagePath, fileName, fileType, fileSizeKB } = req.body;
 
-        // VALIDACIÓN DE INTEGRIDAD: Extensión vs MIME Type
+        // Validación de extensión vs MIME (Defensa en Profundidad)
         const extension = fileName.split('.').pop().toLowerCase();
-        
-        // Mapa de tipos permitidos y sus extensiones seguras
         const mimeMap = {
             'pdf': ['application/pdf'],
             'png': ['image/png'],
@@ -374,23 +404,19 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
             'txt': ['text/plain']
         };
 
-        // Si la extensión está en nuestra lista blanca, verificamos que el MIME coincida
         if (mimeMap[extension]) {
-            const allowedMimes = mimeMap[extension];
-            if (!allowedMimes.some(mime => fileType.includes(mime))) {
-                 console.warn(`[SEGURIDAD] Bloqueo de archivo sospechoso. Ext: .${extension}, MIME: ${fileType}`);
-                 return res.status(400).json({ error: 'El tipo de archivo no coincide con la extensión declarada.' });
+            if (!mimeMap[extension].some(mime => fileType.includes(mime))) {
+                 return res.status(400).json({ error: 'Discrepancia detectada entre extensión y tipo de archivo.' });
             }
         } else {
-            // Opcional: Bloquear extensiones desconocidas o permitir con advertencia
-            // Para máxima seguridad, descomentar la siguiente línea:
-            // return res.status(400).json({ error: 'Tipo de archivo no permitido.' });
+             // Opcional: Rechazar extensiones no permitidas
+             // return res.status(400).json({ error: 'Tipo de archivo no soportado.' });
         }
 
         const { data, error } = await req.clinicClient.from('archivos_adjuntos').insert({
             cliente_id: clienteId,
             storage_path: storagePath,
-            file_name: fileName, // Ya viene sanitizado de generate-upload-url
+            file_name: fileName,
             file_type: fileType,
             file_size_kb: fileSizeKB
         }).select().single();
@@ -400,7 +426,11 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error registrando archivo.' }); }
 });
 
-app.get('/api/files/:clienteId', dynamicDbMiddleware, async (req, res) => {
+// GET Archivos - Protegido con RBAC
+app.get('/api/files/:clienteId', 
+    dynamicDbMiddleware, 
+    requireRole(STAFF_ROLES), 
+    async (req, res) => {
     try {
         const { data, error } = await req.clinicClient.from('archivos_adjuntos')
             .select('*').eq('cliente_id', req.params.clienteId).order('created_at', { ascending: false });
@@ -409,7 +439,7 @@ app.get('/api/files/:clienteId', dynamicDbMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error obteniendo archivos.' }); }
 });
 
-app.get('/api/chat-history/:telefono', dynamicDbMiddleware, async (req, res) => {
+app.get('/api/chat-history/:telefono', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
         const phone = req.params.telefono.replace(/\D/g, ''); 
         if (!phone) return res.json([]);
@@ -420,4 +450,4 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, async (req, res) => 
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE+ RBAC Operativo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE V3 Operativo en puerto ${PORT}`));
