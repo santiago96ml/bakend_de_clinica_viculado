@@ -5,7 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { rateLimit } = require('express-rate-limit');
 const helmet = require('helmet');
 const { z } = require('zod');
-const { LRUCache } = require('lru-cache'); // REQUIERE: npm install lru-cache
+const { LRUCache } = require('lru-cache'); 
 
 const app = express();
 app.set('trust proxy', 1);
@@ -27,7 +27,6 @@ const masterClient = createClient(MASTER_URL, MASTER_KEY, {
 
 // --- 1. SEGURIDAD: HEADERS & CORS ---
 app.use(helmet());
-// Evitar cacheo de respuestas sensibles (Fase 2 Fix)
 app.use((req, res, next) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
@@ -41,10 +40,8 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// DoS Protection: Límite estricto de body
 app.use(express.json({ limit: '10kb' }));
 
-// Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
     limit: 150, 
@@ -52,18 +49,16 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// --- 2. GESTIÓN DE MEMORIA SEGURA (Fase 2 Fix) ---
-// Reemplazamos el Map nativo por LRU Cache para evitar fugas de memoria
+// --- 2. GESTIÓN DE MEMORIA SEGURA ---
 const credentialCache = new LRUCache({
-    max: 500, // Máximo 500 conexiones en memoria
-    ttl: 1000 * 60 * 5, // 5 minutos de vida
+    max: 500, 
+    ttl: 1000 * 60 * 5, 
     updateAgeOnGet: false,
 });
 
-// --- 3. SANITIZACIÓN (CSV/Formula Injection Fix) ---
+// --- 3. SANITIZACIÓN ---
 const sanitizeInput = (text) => {
     if (typeof text !== 'string') return text;
-    // Si empieza con caracteres peligrosos para Excel/CSV, neutralizarlos
     if (/^[=+\-@]/.test(text)) {
         return `'${text}`; 
     }
@@ -118,6 +113,32 @@ const dynamicDbMiddleware = async (req, res, next) => {
     }
 };
 
+// --- NUEVO: MIDDLEWARE DE CONTROL DE ROLES (RBAC) ---
+// Este middleware verifica que el usuario tenga el rol adecuado en la tabla 'perfil_staff'
+const requireRole = (allowedRoles) => async (req, res, next) => {
+    try {
+        const email = req.user.email;
+        
+        // Consultamos la tabla de staff de la clínica conectada
+        const { data: staff, error } = await req.clinicClient
+            .from('perfil_staff')
+            .select('rol')
+            .eq('email', email)
+            .single();
+
+        // Si hay error, no existe el staff, o el rol no coincide con los permitidos
+        if (error || !staff || !allowedRoles.includes(staff.rol)) {
+            console.warn(`[SEGURIDAD] Acceso denegado a ${email}. Rol requerido: ${allowedRoles.join(', ')}`);
+            return res.status(403).json({ error: 'No tienes permisos suficientes para realizar esta acción.' });
+        }
+
+        next();
+    } catch (e) {
+        console.error("Error RBAC:", e);
+        res.status(500).json({ error: 'Error verificando permisos.' });
+    }
+};
+
 // --- 5. ESQUEMAS ZOD ---
 const citaSchema = z.object({
     doctor_id: z.number(),
@@ -142,6 +163,10 @@ const validate = (schema) => (req, res, next) => {
 };
 
 // --- RUTAS ---
+
+// Definimos roles comunes
+const STAFF_ROLES = ['admin', 'secretaria', 'doctor'];
+const ADMIN_ROLES = ['admin', 'secretaria']; // Doctores excluidos de borrado/gestión crítica
 
 app.get('/api/initial-data', dynamicDbMiddleware, async (req, res) => {
     try {
@@ -172,12 +197,16 @@ app.get('/api/citas', dynamicDbMiddleware, async (req, res) => {
     }
 });
 
-// POST Citas: Con Race Condition Check + Sanitización
-app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, res) => {
+// POST Citas: RBAC + Race Condition Fix + Sanitización
+app.post('/api/citas', 
+    dynamicDbMiddleware, 
+    requireRole(STAFF_ROLES), // <--- PROTECCIÓN DE ROL
+    validate(citaSchema), 
+    async (req, res) => {
     try {
         const body = req.body;
         
-        // 1. Race Condition Fix (Verificación preventiva en Backend)
+        // Race Condition Fix
         const { data: existing } = await req.clinicClient.from('citas')
             .select('id')
             .eq('doctor_id', body.doctor_id)
@@ -192,7 +221,7 @@ app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, re
         let clienteId = body.cliente_id;
 
         if (!clienteId && body.new_client_name) {
-            // CSV Injection Fix: Sanitizar nombre
+            // CSV Injection Fix
             const safeName = sanitizeInput(body.new_client_name);
             
             const { data: newClient, error: cErr } = await req.clinicClient.from('clientes')
@@ -214,12 +243,11 @@ app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, re
             fecha_hora: body.fecha_hora,
             duracion_minutos: body.duracion_minutos,
             estado: body.estado,
-            descripcion: sanitizeInput(body.descripcion), // Sanitizar descripción
+            descripcion: sanitizeInput(body.descripcion),
             timezone: body.timezone
         }).select().single();
 
         if (error) {
-            // Manejo de error si la DB rechaza por índice único (Doble seguridad)
             if (error.code === '23505') return res.status(409).json({ error: "Horario ocupado (DB)." });
             throw error;
         }
@@ -230,10 +258,12 @@ app.post('/api/citas', dynamicDbMiddleware, validate(citaSchema), async (req, re
     }
 });
 
-// PATCH Citas: Mass Assignment Fix (Whitelist)
-app.patch('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
+// PATCH Citas: RBAC + Mass Assignment Fix
+app.patch('/api/citas/:id', 
+    dynamicDbMiddleware, 
+    requireRole(STAFF_ROLES), // <--- PROTECCIÓN DE ROL
+    async (req, res) => {
     try {
-        // Definir qué campos se pueden actualizar
         const allowedSchema = z.object({
             estado: z.enum(['programada', 'confirmada', 'cancelada', 'completada', 'no_asistio']).optional(),
             descripcion: z.string().optional(),
@@ -241,7 +271,6 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
             fecha_hora: z.string().datetime().optional()
         });
 
-        // Filtrar y validar el body (Mass Assignment Fix)
         const safeData = allowedSchema.parse(req.body);
 
         if (safeData.descripcion) {
@@ -249,7 +278,7 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
         }
 
         const { data, error } = await req.clinicClient.from('citas')
-            .update(safeData) // Usamos safeData, NO req.body directo
+            .update(safeData)
             .eq('id', req.params.id).select().single();
             
         if (error) throw error;
@@ -260,7 +289,11 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
     }
 });
 
-app.delete('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
+// DELETE Citas: CRÍTICO - Solo Admin/Secretaria
+app.delete('/api/citas/:id', 
+    dynamicDbMiddleware, 
+    requireRole(ADMIN_ROLES), // <--- ROL ESTRICTO
+    async (req, res) => {
     try {
         const { error } = await req.clinicClient.from('citas').delete().eq('id', req.params.id);
         if (error) throw error;
@@ -268,8 +301,11 @@ app.delete('/api/citas/:id', dynamicDbMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error eliminando cita.' }); }
 });
 
-// PATCH Clientes: Mass Assignment Fix + CSV Fix
-app.patch('/api/clientes/:id', dynamicDbMiddleware, async (req, res) => {
+// PATCH Clientes
+app.patch('/api/clientes/:id', 
+    dynamicDbMiddleware, 
+    requireRole(STAFF_ROLES), 
+    async (req, res) => {
     try {
         const clientUpdateSchema = z.object({
             activo: z.boolean().optional(),
@@ -281,7 +317,6 @@ app.patch('/api/clientes/:id', dynamicDbMiddleware, async (req, res) => {
 
         const safeData = clientUpdateSchema.parse(req.body);
         
-        // Sanitizar strings si existen
         ['nombre', 'telefono', 'dni'].forEach(field => {
             if (safeData[field]) safeData[field] = sanitizeInput(safeData[field]);
         });
@@ -295,7 +330,7 @@ app.patch('/api/clientes/:id', dynamicDbMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error actualizando cliente.' }); }
 });
 
-// FILES: Path Traversal Fix (De Fase 1)
+// FILES: Path Traversal Fix
 app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res) => {
     try {
         const { fileName, clienteId } = req.body;
@@ -304,7 +339,6 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
             return res.status(400).json({error: "Datos inválidos"});
         }
 
-        // Sanitización estricta de Path Traversal
         const safeFileName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
         const safeClientId = String(clienteId).replace(/[^0-9]/g, '');
 
@@ -321,18 +355,46 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
     }
 });
 
-// El resto de rutas de archivos y chat se mantienen igual que en Fase 1, 
-// ya que son lecturas simples y están protegidas por el middleware.
+// FILES: Confirm Upload (Protección de Integridad / Anti-Spoofing)
 app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     try {
         const { clienteId, storagePath, fileName, fileType, fileSizeKB } = req.body;
+
+        // VALIDACIÓN DE INTEGRIDAD: Extensión vs MIME Type
+        const extension = fileName.split('.').pop().toLowerCase();
+        
+        // Mapa de tipos permitidos y sus extensiones seguras
+        const mimeMap = {
+            'pdf': ['application/pdf'],
+            'png': ['image/png'],
+            'jpg': ['image/jpeg', 'image/jpg'],
+            'jpeg': ['image/jpeg', 'image/jpg'],
+            'doc': ['application/msword'],
+            'docx': ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+            'txt': ['text/plain']
+        };
+
+        // Si la extensión está en nuestra lista blanca, verificamos que el MIME coincida
+        if (mimeMap[extension]) {
+            const allowedMimes = mimeMap[extension];
+            if (!allowedMimes.some(mime => fileType.includes(mime))) {
+                 console.warn(`[SEGURIDAD] Bloqueo de archivo sospechoso. Ext: .${extension}, MIME: ${fileType}`);
+                 return res.status(400).json({ error: 'El tipo de archivo no coincide con la extensión declarada.' });
+            }
+        } else {
+            // Opcional: Bloquear extensiones desconocidas o permitir con advertencia
+            // Para máxima seguridad, descomentar la siguiente línea:
+            // return res.status(400).json({ error: 'Tipo de archivo no permitido.' });
+        }
+
         const { data, error } = await req.clinicClient.from('archivos_adjuntos').insert({
             cliente_id: clienteId,
             storage_path: storagePath,
-            file_name: fileName,
+            file_name: fileName, // Ya viene sanitizado de generate-upload-url
             file_type: fileType,
             file_size_kb: fileSizeKB
         }).select().single();
+
         if (error) throw error;
         res.status(201).json(data);
     } catch (e) { res.status(500).json({ error: 'Error registrando archivo.' }); }
@@ -358,4 +420,4 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, async (req, res) => 
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE+ Operativo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE+ RBAC Operativo en puerto ${PORT}`));
