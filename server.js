@@ -8,13 +8,19 @@ const { z } = require('zod');
 const { LRUCache } = require('lru-cache'); 
 
 const app = express();
-app.set('trust proxy', 1); // Necesario si estás detrás de un proxy (Nginx/EasyPanel)
+
+// 1. TRUST PROXY: Necesario para Cloudflare WAF
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 3002;
 
-// Variables de entorno
+// CONFIGURACIÓN DE DOMINIOS (PRODUCCIÓN)
+// El frontend que consume esta API estará en vintex.net.br
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
+
+// Variables de Entorno (Master)
 const MASTER_URL = process.env.MASTER_SUPABASE_URL;
 const MASTER_KEY = process.env.MASTER_SUPABASE_SERVICE_KEY;
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://tu-dominio-frontend.com";
 
 if (!MASTER_URL || !MASTER_KEY) {
     console.error("❌ ERROR CRÍTICO: Faltan credenciales MASTER en .env");
@@ -25,10 +31,9 @@ const masterClient = createClient(MASTER_URL, MASTER_KEY, {
     auth: { autoRefreshToken: false, persistSession: false }
 });
 
-// --- 1. CAPA DE SEGURIDAD: HEADERS & CORS ---
+// --- SEGURIDAD: HEADERS & CORS ---
 app.use(helmet());
 app.use((req, res, next) => {
-    // Evita caché en respuestas API para proteger datos médicos
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
@@ -36,16 +41,15 @@ app.use((req, res, next) => {
 });
 
 app.use(cors({
-    origin: [FRONTEND_URL, 'http://localhost:5173'],
+    origin: [FRONTEND_URL, 'https://vintex.net.br', 'http://localhost:5173'],
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-owner-id'],
     credentials: true
 }));
 
-// Protección contra DoS (Payload grande)
 app.use(express.json({ limit: '10kb' }));
 
-// Rate Limiting (150 peticiones cada 15 min por IP)
+// Rate Limit (150/15min)
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
     limit: 150, 
@@ -53,59 +57,50 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// --- 2. LOGGER SIEM-READY (Logs Inteligentes) ---
-// Genera logs en JSON estructurado para herramientas de auditoría (Wazuh, Datadog)
+// --- LOGGER INTELIGENTE (SIEM-Ready) ---
 const structuredLogger = (req, res, next) => {
     const start = Date.now();
-    
-    // Interceptamos el final de la respuesta para medir tiempo y capturar estado
     const oldSend = res.send;
     res.send = function(data) {
         const duration = Date.now() - start;
-        res.send = oldSend; // Restauramos función original
+        res.send = oldSend;
         
-        // Objeto de Log Estructurado
         const logEvent = {
             timestamp: new Date().toISOString(),
             level: res.statusCode >= 400 ? 'error' : 'info',
             event_type: 'http_request',
-            environment: process.env.NODE_ENV || 'development',
+            environment: process.env.NODE_ENV || 'production',
             req: {
                 method: req.method,
                 url: req.originalUrl,
                 ip: req.ip,
                 user_agent: req.headers['user-agent'],
                 user_id: req.user ? req.user.id : 'anonymous',
-                role: req.userRole || 'unknown' // Capturado del middleware RBAC
+                role: req.userRole || 'unknown'
             },
             res: {
                 status_code: res.statusCode,
                 duration_ms: duration
             }
         };
-
-        // En producción, esto se enviaría a un colector de logs.
         console.log(JSON.stringify(logEvent));
-        
         return res.send(data);
     };
     next();
 };
-
 app.use(structuredLogger);
 
-// --- 3. GESTIÓN DE MEMORIA SEGURA (Caché LRU) ---
+// --- CACHÉ DE MEMORIA ---
 const credentialCache = new LRUCache({
-    max: 500, // Máximo 500 conexiones en memoria RAM
-    ttl: 1000 * 60 * 5, // 5 minutos de vida
+    max: 500, 
+    ttl: 1000 * 60 * 5, 
     updateAgeOnGet: false,
 });
 
-// --- 5. MIDDLEWARE MULTI-TENANT (Conexión Dinámica) ---
+// --- MIDDLEWARE MULTI-TENANT (Con verificación de Email) ---
 const dynamicDbMiddleware = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    // Header especial para cuando el Staff accede a la clínica del Dueño
     const targetOwnerId = req.headers['x-owner-id']; 
 
     if (!token) return res.status(401).json({ error: 'Token requerido' });
@@ -113,16 +108,12 @@ const dynamicDbMiddleware = async (req, res, next) => {
     try {
         const { data: { user }, error: authError } = await masterClient.auth.getUser(token);
 
-        // CORRECCIÓN: Bypass de Autenticación por Email No Verificado
+        // CHECK: Email Verificado (Anti-Spoofing)
         if (authError || !user || !user.email_confirmed_at) {
             return res.status(403).json({ error: 'Token inválido o email no verificado.' });
         }
 
         req.user = user;
-        
-        // Determinar a qué clínica conectar:
-        // Si hay targetOwnerId, es un Staff entrando a la clínica de un jefe.
-        // Si no, es el propio dueño entrando a su clínica.
         const clinicOwnerId = targetOwnerId || user.id;
 
         let clinicConfig = credentialCache.get(clinicOwnerId);
@@ -149,7 +140,7 @@ const dynamicDbMiddleware = async (req, res, next) => {
             auth: { autoRefreshToken: false, persistSession: false }
         });
 
-        // Verificación de Pertenencia (Seguridad Staff)
+        // CHECK: Pertenencia Staff
         if (user.id !== clinicOwnerId) {
             const { data: staffMember, error: staffError } = await req.clinicClient
                 .from('perfil_staff')
@@ -158,12 +149,11 @@ const dynamicDbMiddleware = async (req, res, next) => {
                 .single();
 
             if (staffError || !staffMember) {
-                // El logger capturará este 403 alertando posible intrusión
-                return res.status(403).json({ error: 'No tienes permisos de Staff en esta clínica.' });
+                return res.status(403).json({ error: 'No tienes permisos de Staff.' });
             }
             req.userRole = staffMember.rol; 
         } else {
-            req.userRole = 'admin'; // El dueño es Admin Supremo
+            req.userRole = 'admin';
         }
 
         next();
@@ -174,11 +164,10 @@ const dynamicDbMiddleware = async (req, res, next) => {
     }
 };
 
-// --- MIDDLEWARE RBAC (Control de Roles) ---
+// --- MIDDLEWARE RBAC ---
 const requireRole = (allowedRoles) => async (req, res, next) => {
     try {
         let rol = req.userRole;
-        // Si no se resolvió antes (ej. caché de conexión), verificamos de nuevo
         if (!rol) {
              const { data: staff } = await req.clinicClient
                 .from('perfil_staff')
@@ -186,7 +175,7 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
                 .eq('email', req.user.email)
                 .single();
              rol = staff ? staff.rol : 'admin'; 
-             req.userRole = rol; // Actualizamos para el logger
+             req.userRole = rol;
         }
 
         if (!allowedRoles.includes(rol)) {
@@ -198,7 +187,7 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
     }
 };
 
-// --- ESQUEMAS ZOD (Validación Estricta) ---
+// --- ESQUEMAS ZOD ---
 const citaSchema = z.object({
     doctor_id: z.number(),
     cliente_id: z.number().optional().nullable(),
@@ -228,9 +217,8 @@ const validate = (schema) => (req, res, next) => {
 
 // --- RUTAS DE API ---
 const STAFF_ROLES = ['admin', 'secretaria', 'doctor'];
-const ADMIN_ROLES = ['admin', 'secretaria']; // Doctores excluidos de acciones destructivas
+const ADMIN_ROLES = ['admin', 'secretaria'];
 
-// GET Data Inicial
 app.get('/api/initial-data', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
         const [docs, clients] = await Promise.all([
@@ -241,7 +229,6 @@ app.get('/api/initial-data', dynamicDbMiddleware, requireRole(STAFF_ROLES), asyn
     } catch (e) { res.status(500).json({ error: 'Error obteniendo datos.' }); }
 });
 
-// GET Citas (Validado + Protegido)
 app.get('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
         const { start, end } = queryCitasSchema.parse(req.query);
@@ -259,11 +246,10 @@ app.get('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req,
     }
 });
 
-// POST Citas (Race Condition Fix + Sanitización eliminada en entrada)
 app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(citaSchema), async (req, res) => {
     try {
         const body = req.body;
-        // Chequeo de Concurrencia (Doble reserva)
+        // Race Condition Check
         const { data: existing } = await req.clinicClient.from('citas')
             .select('id').eq('doctor_id', body.doctor_id).eq('fecha_hora', body.fecha_hora).neq('estado', 'cancelada').single();
 
@@ -271,8 +257,7 @@ app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(c
 
         let clienteId = body.cliente_id;
         if (!clienteId && body.new_client_name) {
-            // CORRECCIÓN: Se eliminó sanitizeInput para no corromper datos
-            const safeName = body.new_client_name;
+            const safeName = body.new_client_name; 
             const { data: newClient, error: cErr } = await req.clinicClient.from('clientes')
                 .insert({
                     nombre: safeName,
@@ -298,7 +283,6 @@ app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(c
     } catch (e) { res.status(400).json({ error: 'Error al crear la cita.' }); }
 });
 
-// PATCH Citas (Mass Assignment Fix)
 app.patch('/api/citas/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
         const allowedSchema = z.object({
@@ -308,8 +292,7 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async
             fecha_hora: z.string().datetime().optional()
         });
         const safeData = allowedSchema.parse(req.body);
-        // CORRECCIÓN: Se eliminó sanitización redundante que corrompía datos
-
+        
         const { data, error } = await req.clinicClient.from('citas').update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
         res.json(data);
@@ -319,7 +302,6 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async
     }
 });
 
-// DELETE Citas (Solo Admin)
 app.delete('/api/citas/:id', dynamicDbMiddleware, requireRole(ADMIN_ROLES), async (req, res) => {
     try {
         const { error } = await req.clinicClient.from('citas').delete().eq('id', req.params.id);
@@ -328,7 +310,6 @@ app.delete('/api/citas/:id', dynamicDbMiddleware, requireRole(ADMIN_ROLES), asyn
     } catch (e) { res.status(500).json({ error: 'Error eliminando.' }); }
 });
 
-// PATCH Clientes
 app.patch('/api/clientes/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
         const clientUpdateSchema = z.object({
@@ -336,15 +317,13 @@ app.patch('/api/clientes/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), as
             nombre: z.string().min(2).optional(), telefono: z.string().optional(), dni: z.string().optional()
         });
         const safeData = clientUpdateSchema.parse(req.body);
-        // CORRECCIÓN: Se eliminó el bucle de sanitización que agregaba comillas
-
+        
         const { data, error } = await req.clinicClient.from('clientes').update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
         res.json(data);
     } catch (e) { res.status(500).json({ error: 'Error actualizando cliente.' }); }
 });
 
-// FILES: Generar URL (CORRECCIÓN CRÍTICA: Anti-Spoofing en Descarga)
 app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res) => {
     try {
         const { fileName, clienteId } = req.body;
@@ -354,8 +333,7 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
         const safeClientId = String(clienteId).replace(/[^0-9]/g, '');
         const filePath = `${safeClientId}/${Date.now()}_${safeFileName}`;
         
-        // 🔥 CRÍTICO: download: true fuerza 'Content-Disposition: attachment'.
-        // Impide que un HTML/SVG malicioso se ejecute en el navegador.
+        // Anti-Spoofing: Force download
         const { data, error } = await req.clinicClient.storage.from('adjuntos') 
             .createSignedUploadUrl(filePath, 60 * 10, { download: true });
 
@@ -364,18 +342,16 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
     } catch (e) { res.status(500).json({ error: 'Error generando URL.' }); }
 });
 
-// FILES: Confirmar Subida (Validación de Integridad)
 app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     try {
         const { clienteId, storagePath, fileName, fileType, fileSizeKB } = req.body;
         
-        // CORRECCIÓN: Evasión de Filtro (Double Extension Attack)
+        // CHECK: Doble Extensión Peligrosa
         const dangerousExtensions = ['.php', '.exe', '.sh', '.js', '.bat'];
         if (dangerousExtensions.some(ext => fileName.toLowerCase().includes(ext + '.'))) {
              return res.status(400).json({ error: 'Nombre de archivo sospechoso.' });
         }
 
-        // Verificación de extensión vs MIME Type
         const extension = fileName.split('.').pop().toLowerCase();
         const mimeMap = {
             'pdf': ['application/pdf'], 'png': ['image/png'],
@@ -386,7 +362,7 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
 
         if (mimeMap[extension]) {
             if (!mimeMap[extension].some(mime => fileType.includes(mime))) {
-                 return res.status(400).json({ error: 'Discrepancia de tipo de archivo (Posible Spoofing).' });
+                 return res.status(400).json({ error: 'Discrepancia de tipo de archivo.' });
             }
         }
         
@@ -400,7 +376,6 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Error registrando archivo.' }); }
 });
 
-// GET Archivos (Protegido)
 app.get('/api/files/:clienteId', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
         const { data, error } = await req.clinicClient.from('archivos_adjuntos')
@@ -421,4 +396,4 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, requireRole(STAFF_RO
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE V5 (SIEM-Ready) Operativo en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE (Vintex.net.br) en puerto ${PORT}`));
