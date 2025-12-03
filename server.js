@@ -396,4 +396,4 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, requireRole(STAFF_RO
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE (Vintex.net.br) en puerto ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE (api-clinica.vintex.net.br) en puerto ${PORT}`));
