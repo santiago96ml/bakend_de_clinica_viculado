@@ -101,16 +101,6 @@ const credentialCache = new LRUCache({
     updateAgeOnGet: false,
 });
 
-// --- 4. SANITIZACIÓN (Anti-CSV Injection) ---
-const sanitizeInput = (text) => {
-    if (typeof text !== 'string') return text;
-    // Neutraliza fórmulas de Excel maliciosas
-    if (/^[=+\-@]/.test(text)) {
-        return `'${text}`; 
-    }
-    return text;
-};
-
 // --- 5. MIDDLEWARE MULTI-TENANT (Conexión Dinámica) ---
 const dynamicDbMiddleware = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -123,8 +113,9 @@ const dynamicDbMiddleware = async (req, res, next) => {
     try {
         const { data: { user }, error: authError } = await masterClient.auth.getUser(token);
 
-        if (authError || !user) {
-            return res.status(403).json({ error: 'Token inválido o expirado' });
+        // CORRECCIÓN: Bypass de Autenticación por Email No Verificado
+        if (authError || !user || !user.email_confirmed_at) {
+            return res.status(403).json({ error: 'Token inválido o email no verificado.' });
         }
 
         req.user = user;
@@ -268,7 +259,7 @@ app.get('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req,
     }
 });
 
-// POST Citas (Race Condition Fix + Sanitización)
+// POST Citas (Race Condition Fix + Sanitización eliminada en entrada)
 app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(citaSchema), async (req, res) => {
     try {
         const body = req.body;
@@ -280,12 +271,13 @@ app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(c
 
         let clienteId = body.cliente_id;
         if (!clienteId && body.new_client_name) {
-            const safeName = sanitizeInput(body.new_client_name);
+            // CORRECCIÓN: Se eliminó sanitizeInput para no corromper datos
+            const safeName = body.new_client_name;
             const { data: newClient, error: cErr } = await req.clinicClient.from('clientes')
                 .insert({
                     nombre: safeName,
-                    dni: sanitizeInput(body.new_client_dni || ''),
-                    telefono: sanitizeInput(body.new_client_telefono || ''),
+                    dni: body.new_client_dni || '', 
+                    telefono: body.new_client_telefono || '',
                     activo: true, solicitud_de_secretaría: false 
                 }).select().single();
             if (cErr) throw cErr;
@@ -295,7 +287,7 @@ app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(c
         const { data, error } = await req.clinicClient.from('citas').insert({
             doctor_id: body.doctor_id, cliente_id: clienteId, fecha_hora: body.fecha_hora,
             duracion_minutos: body.duracion_minutos, estado: body.estado,
-            descripcion: sanitizeInput(body.descripcion), timezone: body.timezone
+            descripcion: body.descripcion, timezone: body.timezone
         }).select().single();
 
         if (error) {
@@ -316,7 +308,7 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async
             fecha_hora: z.string().datetime().optional()
         });
         const safeData = allowedSchema.parse(req.body);
-        if (safeData.descripcion) safeData.descripcion = sanitizeInput(safeData.descripcion);
+        // CORRECCIÓN: Se eliminó sanitización redundante que corrompía datos
 
         const { data, error } = await req.clinicClient.from('citas').update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
@@ -344,7 +336,7 @@ app.patch('/api/clientes/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), as
             nombre: z.string().min(2).optional(), telefono: z.string().optional(), dni: z.string().optional()
         });
         const safeData = clientUpdateSchema.parse(req.body);
-        ['nombre', 'telefono', 'dni'].forEach(k => { if(safeData[k]) safeData[k] = sanitizeInput(safeData[k]); });
+        // CORRECCIÓN: Se eliminó el bucle de sanitización que agregaba comillas
 
         const { data, error } = await req.clinicClient.from('clientes').update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
@@ -377,6 +369,12 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     try {
         const { clienteId, storagePath, fileName, fileType, fileSizeKB } = req.body;
         
+        // CORRECCIÓN: Evasión de Filtro (Double Extension Attack)
+        const dangerousExtensions = ['.php', '.exe', '.sh', '.js', '.bat'];
+        if (dangerousExtensions.some(ext => fileName.toLowerCase().includes(ext + '.'))) {
+             return res.status(400).json({ error: 'Nombre de archivo sospechoso.' });
+        }
+
         // Verificación de extensión vs MIME Type
         const extension = fileName.split('.').pop().toLowerCase();
         const mimeMap = {
