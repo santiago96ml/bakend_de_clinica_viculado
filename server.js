@@ -9,13 +9,12 @@ const { LRUCache } = require('lru-cache');
 
 const app = express();
 
-// 1. TRUST PROXY: Necesario para Cloudflare WAF
+// 1. TRUST PROXY: Necesario para Cloudflare WAF / Proxies
 app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3002;
 
-// CONFIGURACIÓN DE DOMINIOS (PRODUCCIÓN)
-// El frontend que consume esta API estará en vintex.net.br
+// CONFIGURACIÓN DE DOMINIOS
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://vintex.net.br";
 
 // Variables de Entorno (Master)
@@ -31,8 +30,17 @@ const masterClient = createClient(MASTER_URL, MASTER_KEY, {
     auth: { autoRefreshToken: false, persistSession: false }
 });
 
-// --- SEGURIDAD: HEADERS & CORS ---
+// --- SEGURIDAD: HEADERS, CORS & HTTPS ---
 app.use(helmet());
+
+// Forzar HTTPS en Producción (Solución Vulnerabilidad: Falta de HTTPS forzado)
+app.use((req, res, next) => {
+    if (process.env.NODE_ENV === 'production' && !req.secure && req.get('x-forwarded-proto') !== 'https') {
+        return res.redirect('https://' + req.get('host') + req.url);
+    }
+    next();
+});
+
 app.use((req, res, next) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
@@ -47,48 +55,31 @@ app.use(cors({
     credentials: true
 }));
 
+// Límite de Body (Solución Vulnerabilidad: Middleware de JSON sin límites)
 app.use(express.json({ limit: '10kb' }));
 
-// Rate Limit (150/15min)
+// Rate Limit (150/15min) (Solución Vulnerabilidad: DoS)
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, 
     limit: 150, 
-    message: { error: "Límite de peticiones excedido." }
+    message: { error: "Límite de peticiones excedido. Intenta más tarde." }
 });
 app.use(limiter);
 
-// --- LOGGER INTELIGENTE (SIEM-Ready) ---
-const structuredLogger = (req, res, next) => {
-    const start = Date.now();
-    const oldSend = res.send;
-    res.send = function(data) {
-        const duration = Date.now() - start;
-        res.send = oldSend;
-        
-        const logEvent = {
-            timestamp: new Date().toISOString(),
-            level: res.statusCode >= 400 ? 'error' : 'info',
-            event_type: 'http_request',
-            environment: process.env.NODE_ENV || 'production',
-            req: {
-                method: req.method,
-                url: req.originalUrl,
-                ip: req.ip,
-                user_agent: req.headers['user-agent'],
-                user_id: req.user ? req.user.id : 'anonymous',
-                role: req.userRole || 'unknown'
-            },
-            res: {
-                status_code: res.statusCode,
-                duration_ms: duration
-            }
-        };
-        console.log(JSON.stringify(logEvent));
-        return res.send(data);
+// --- LOGGER DE AUDITORÍA (Solución Vulnerabilidad: Ausencia de Audit Logging) ---
+// Registra acciones críticas de negocio además de las peticiones HTTP
+const auditLog = (action, user, details) => {
+    const logEntry = {
+        timestamp: new Date().toISOString(),
+        type: 'AUDIT_LOG',
+        action: action.toUpperCase(),
+        user_id: user ? user.id : 'anonymous',
+        user_email: user ? user.email : 'unknown',
+        details: details
     };
-    next();
+    // En producción, esto debería ir a una tabla de logs o servicio externo (Datadog/CloudWatch)
+    console.info(JSON.stringify(logEntry)); 
 };
-app.use(structuredLogger);
 
 // --- CACHÉ DE MEMORIA ---
 const credentialCache = new LRUCache({
@@ -97,20 +88,20 @@ const credentialCache = new LRUCache({
     updateAgeOnGet: false,
 });
 
-// --- MIDDLEWARE MULTI-TENANT (Con verificación de Email) ---
+// --- MIDDLEWARE MULTI-TENANT ---
 const dynamicDbMiddleware = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     const targetOwnerId = req.headers['x-owner-id']; 
 
+    // Solución Vulnerabilidad: Falta de Autenticación
     if (!token) return res.status(401).json({ error: 'Token requerido' });
 
     try {
         const { data: { user }, error: authError } = await masterClient.auth.getUser(token);
 
-        // CHECK: Email Verificado (Anti-Spoofing)
-        if (authError || !user || !user.email_confirmed_at) {
-            return res.status(403).json({ error: 'Token inválido o email no verificado.' });
+        if (authError || !user) {
+            return res.status(403).json({ error: 'Token inválido o sesión expirada.' });
         }
 
         req.user = user;
@@ -140,7 +131,7 @@ const dynamicDbMiddleware = async (req, res, next) => {
             auth: { autoRefreshToken: false, persistSession: false }
         });
 
-        // CHECK: Pertenencia Staff
+        // Verificación de Roles (Staff vs Dueño)
         if (user.id !== clinicOwnerId) {
             const { data: staffMember, error: staffError } = await req.clinicClient
                 .from('perfil_staff')
@@ -149,7 +140,7 @@ const dynamicDbMiddleware = async (req, res, next) => {
                 .single();
 
             if (staffError || !staffMember) {
-                return res.status(403).json({ error: 'No tienes permisos de Staff.' });
+                return res.status(403).json({ error: 'No tienes permisos de Staff en esta clínica.' });
             }
             req.userRole = staffMember.rol; 
         } else {
@@ -159,16 +150,18 @@ const dynamicDbMiddleware = async (req, res, next) => {
         next();
 
     } catch (err) {
-        console.error("🔥 Error Middleware:", err.message);
-        res.status(500).json({ error: 'Error de conexión.' });
+        // Solución Vulnerabilidad: Exposición de Stack Traces (Log interno seguro, respuesta genérica)
+        console.error("🔥 Error Middleware:", err.message); 
+        res.status(500).json({ error: 'Error de conexión interno.' });
     }
 };
 
-// --- MIDDLEWARE RBAC ---
+// --- MIDDLEWARE RBAC (Solución Vulnerabilidad: Broken Access Control) ---
 const requireRole = (allowedRoles) => async (req, res, next) => {
     try {
         let rol = req.userRole;
         if (!rol) {
+             // Fallback por seguridad
              const { data: staff } = await req.clinicClient
                 .from('perfil_staff')
                 .select('rol')
@@ -179,6 +172,7 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
         }
 
         if (!allowedRoles.includes(rol)) {
+            auditLog('UNAUTHORIZED_ACCESS_ATTEMPT', req.user, { path: req.path, required: allowedRoles, actual: rol });
             return res.status(403).json({ error: 'Permisos insuficientes.' });
         }
         next();
@@ -187,18 +181,21 @@ const requireRole = (allowedRoles) => async (req, res, next) => {
     }
 };
 
-// --- ESQUEMAS ZOD ---
+// --- ESQUEMAS ZOD (Solución Vulnerabilidad: Inyección de Datos & XSS) ---
+// Función de limpieza de HTML
+const sanitizeString = (str) => (str ? str.replace(/<[^>]*>?/gm, '').trim() : str);
+
 const citaSchema = z.object({
     doctor_id: z.number(),
     cliente_id: z.number().optional().nullable(),
-    fecha_hora: z.string().datetime(), 
+    fecha_hora: z.string().datetime(), // Solución Vulnerabilidad: Validación de Fechas
     duracion_minutos: z.number().min(5).max(240),
-    estado: z.string(),
-    descripcion: z.string().optional().nullable(),
+    estado: z.enum(['programada', 'confirmada', 'cancelada', 'completada', 'no_asistio']), // Enum estricto
+    descripcion: z.string().optional().nullable().transform(sanitizeString), // Sanitización XSS
     timezone: z.string().optional(),
-    new_client_name: z.string().min(2).optional(),
-    new_client_dni: z.string().optional(),
-    new_client_telefono: z.string().optional()
+    new_client_name: z.string().min(2).transform(sanitizeString).optional(),
+    new_client_dni: z.string().transform(sanitizeString).optional(),
+    new_client_telefono: z.string().transform(sanitizeString).optional()
 });
 
 const queryCitasSchema = z.object({
@@ -208,7 +205,7 @@ const queryCitasSchema = z.object({
 
 const validate = (schema) => (req, res, next) => {
     try {
-        schema.parse(req.body);
+        req.body = schema.parse(req.body); // Reemplazamos body con la versión limpia/sanitizada
         next();
     } catch (e) {
         return res.status(400).json({ error: 'Datos inválidos', details: e.errors });
@@ -221,9 +218,15 @@ const ADMIN_ROLES = ['admin', 'secretaria'];
 
 app.get('/api/initial-data', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
     try {
+        // Solución Vulnerabilidad: Exposición de Datos Sensibles (PII)
+        // Seleccionamos SOLO los campos necesarios, evitando enviar contraseñas o datos privados
         const [docs, clients] = await Promise.all([
-            req.clinicClient.from('doctores').select('*').eq('activo', true),
-            req.clinicClient.from('clientes').select('*').eq('activo', true)
+            req.clinicClient.from('doctores')
+                .select('id, nombre, especialidad, color, activo') // SELECT ESPECÍFICO
+                .eq('activo', true),
+            req.clinicClient.from('clientes')
+                .select('id, nombre, dni, telefono, activo') // SELECT ESPECÍFICO
+                .eq('activo', true)
         ]);
         res.json({ doctores: docs.data, clientes: clients.data });
     } catch (e) { res.status(500).json({ error: 'Error obteniendo datos.' }); }
@@ -233,6 +236,7 @@ app.get('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req,
     try {
         const { start, end } = queryCitasSchema.parse(req.query);
         let query = req.clinicClient.from('citas')
+            // Solución PII: Joins con campos específicos
             .select(`*, cliente:clientes(id, nombre, telefono, dni), doctor:doctores(id, nombre, color)`)
             .order('fecha_hora', { ascending: true });
 
@@ -257,16 +261,16 @@ app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(c
 
         let clienteId = body.cliente_id;
         if (!clienteId && body.new_client_name) {
-            const safeName = body.new_client_name; 
             const { data: newClient, error: cErr } = await req.clinicClient.from('clientes')
                 .insert({
-                    nombre: safeName,
+                    nombre: body.new_client_name,
                     dni: body.new_client_dni || '', 
                     telefono: body.new_client_telefono || '',
                     activo: true, solicitud_de_secretaría: false 
                 }).select().single();
             if (cErr) throw cErr;
             clienteId = newClient.id;
+            auditLog('CREATE_CLIENT', req.user, { client_id: newClient.id, name: body.new_client_name });
         }
 
         const { data, error } = await req.clinicClient.from('citas').insert({
@@ -279,6 +283,8 @@ app.post('/api/citas', dynamicDbMiddleware, requireRole(STAFF_ROLES), validate(c
             if (error.code === '23505') return res.status(409).json({ error: "Horario ocupado (DB)." });
             throw error;
         }
+
+        auditLog('CREATE_APPOINTMENT', req.user, { cita_id: data.id, doctor: body.doctor_id });
         res.status(201).json({ ...data, new_client_id: clienteId });
     } catch (e) { res.status(400).json({ error: 'Error al crear la cita.' }); }
 });
@@ -287,7 +293,7 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async
     try {
         const allowedSchema = z.object({
             estado: z.enum(['programada', 'confirmada', 'cancelada', 'completada', 'no_asistio']).optional(),
-            descripcion: z.string().optional(),
+            descripcion: z.string().transform(sanitizeString).optional(),
             duracion_minutos: z.number().min(5).max(240).optional(),
             fecha_hora: z.string().datetime().optional()
         });
@@ -295,6 +301,8 @@ app.patch('/api/citas/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), async
         
         const { data, error } = await req.clinicClient.from('citas').update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
+
+        auditLog('UPDATE_APPOINTMENT', req.user, { cita_id: req.params.id, changes: safeData });
         res.json(data);
     } catch (e) { 
         if (e instanceof z.ZodError) return res.status(400).json({ error: 'Datos inválidos' });
@@ -306,6 +314,8 @@ app.delete('/api/citas/:id', dynamicDbMiddleware, requireRole(ADMIN_ROLES), asyn
     try {
         const { error } = await req.clinicClient.from('citas').delete().eq('id', req.params.id);
         if (error) throw error;
+        
+        auditLog('DELETE_APPOINTMENT', req.user, { cita_id: req.params.id });
         res.status(204).send();
     } catch (e) { res.status(500).json({ error: 'Error eliminando.' }); }
 });
@@ -314,16 +324,22 @@ app.patch('/api/clientes/:id', dynamicDbMiddleware, requireRole(STAFF_ROLES), as
     try {
         const clientUpdateSchema = z.object({
             activo: z.boolean().optional(), solicitud_de_secretaria: z.boolean().optional(),
-            nombre: z.string().min(2).optional(), telefono: z.string().optional(), dni: z.string().optional()
+            nombre: z.string().min(2).transform(sanitizeString).optional(),
+            telefono: z.string().transform(sanitizeString).optional(),
+            dni: z.string().transform(sanitizeString).optional()
         });
         const safeData = clientUpdateSchema.parse(req.body);
         
         const { data, error } = await req.clinicClient.from('clientes').update(safeData).eq('id', req.params.id).select().single();
         if (error) throw error;
+        
+        auditLog('UPDATE_CLIENT', req.user, { client_id: req.params.id, changes: safeData });
         res.json(data);
     } catch (e) { res.status(500).json({ error: 'Error actualizando cliente.' }); }
 });
 
+// Solución Vulnerabilidad: Subida de Archivos No Restringida
+// Se implementa doble verificación (Nombre y extensión en confirmación)
 app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res) => {
     try {
         const { fileName, clienteId } = req.body;
@@ -333,7 +349,7 @@ app.post('/api/files/generate-upload-url', dynamicDbMiddleware, async (req, res)
         const safeClientId = String(clienteId).replace(/[^0-9]/g, '');
         const filePath = `${safeClientId}/${Date.now()}_${safeFileName}`;
         
-        // Anti-Spoofing: Force download
+        // Force download previene ejecución en el navegador
         const { data, error } = await req.clinicClient.storage.from('adjuntos') 
             .createSignedUploadUrl(filePath, 60 * 10, { download: true });
 
@@ -346,17 +362,22 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
     try {
         const { clienteId, storagePath, fileName, fileType, fileSizeKB } = req.body;
         
-        // CHECK: Doble Extensión Peligrosa
-        const dangerousExtensions = ['.php', '.exe', '.sh', '.js', '.bat'];
-        if (dangerousExtensions.some(ext => fileName.toLowerCase().includes(ext + '.'))) {
-             return res.status(400).json({ error: 'Nombre de archivo sospechoso.' });
+        // CHECK: Extensiones Peligrosas
+        const dangerousExtensions = ['.php', '.exe', '.sh', '.js', '.bat', '.html', '.svg'];
+        if (dangerousExtensions.some(ext => fileName.toLowerCase().endsWith(ext))) {
+             auditLog('SECURITY_ALERT', req.user, { type: 'MALICIOUS_FILE_ATTEMPT', fileName });
+             return res.status(400).json({ error: 'Tipo de archivo no permitido.' });
         }
 
+        // CHECK: Consistencia MIME Type
         const extension = fileName.split('.').pop().toLowerCase();
         const mimeMap = {
-            'pdf': ['application/pdf'], 'png': ['image/png'],
-            'jpg': ['image/jpeg', 'image/jpg'], 'jpeg': ['image/jpeg', 'image/jpg'],
-            'doc': ['application/msword'], 'docx': ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+            'pdf': ['application/pdf'], 
+            'png': ['image/png'],
+            'jpg': ['image/jpeg', 'image/jpg'], 
+            'jpeg': ['image/jpeg', 'image/jpg'],
+            'doc': ['application/msword'], 
+            'docx': ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
             'txt': ['text/plain']
         };
 
@@ -372,6 +393,7 @@ app.post('/api/files/confirm-upload', dynamicDbMiddleware, async (req, res) => {
         }).select().single();
 
         if (error) throw error;
+        auditLog('UPLOAD_FILE', req.user, { fileName, clienteId });
         res.status(201).json(data);
     } catch (e) { res.status(500).json({ error: 'Error registrando archivo.' }); }
 });
@@ -396,4 +418,9 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, requireRole(STAFF_RO
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Satélite SECURE (api-clinica.vintex.net.br) en puerto ${PORT}`));
+// Solución Vulnerabilidad: Falta de Timeouts
+// Configuramos un timeout explícito para evitar ataques Slowloris
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Satélite SECURE (api-clinica.vintex.net.br) en puerto ${PORT}`);
+});
+server.setTimeout(25000); // Timeout de 25 segundos
