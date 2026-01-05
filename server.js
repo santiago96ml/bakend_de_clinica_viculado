@@ -418,6 +418,25 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, requireRole(STAFF_RO
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
+app.get('/api/metrics', verifyToken, async (req, res) => {
+  try {
+    // Llamamos a la función RPC que creaste en SQL
+    const { data, error } = await supabase.rpc('obtener_estadisticas_generales');
+
+    if (error) {
+      console.error('Error obteniendo métricas:', error);
+      return res.status(500).json({ error: 'Error al calcular estadísticas' });
+    }
+
+    // Enviamos el JSON limpio al frontend
+    res.json(data);
+
+  } catch (err) {
+    console.error('Error servidor:', err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
 // Solución Vulnerabilidad: Falta de Timeouts
 // Configuramos un timeout explícito para evitar ataques Slowloris
 const server = app.listen(PORT, '0.0.0.0', () => {
