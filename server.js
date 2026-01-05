@@ -427,17 +427,13 @@ app.get('/api/metrics', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (re
       return res.status(500).json({ error: 'Error al calcular estadísticas' });
     }
 
-    // --- CORRECCIÓN AQUÍ ---
-    // Si data es un array (comportamiento normal de RPC), devolvemos el primer elemento.
-    // Si data ya es un objeto (depende de cómo definiste la función SQL), lo devolvemos tal cual.
+    // CORRECCIÓN: Extraer el objeto si viene en array
     const stats = Array.isArray(data) && data.length > 0 ? data[0] : (data || {});
     
-    res.json(stats); 
-    // -----------------------
+    res.json(stats); // Ahora siempre envías el objeto limpio
 
   } catch (err) {
-    console.error('Error servidor:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    // ...
   }
 });
 
