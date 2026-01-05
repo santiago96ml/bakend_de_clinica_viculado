@@ -418,17 +418,18 @@ app.get('/api/chat-history/:telefono', dynamicDbMiddleware, requireRole(STAFF_RO
     } catch (e) { res.status(500).json({ error: 'Error cargando chat.' }); }
 });
 
-app.get('/api/metrics', verifyToken, async (req, res) => {
+// --- NUEVA RUTA: Obtener Métricas Generales ---
+// Usamos dynamicDbMiddleware en lugar de verifyToken
+app.get('/api/metrics', dynamicDbMiddleware, requireRole(STAFF_ROLES), async (req, res) => {
   try {
-    // Llamamos a la función RPC que creaste en SQL
-    const { data, error } = await supabase.rpc('obtener_estadisticas_generales');
+    // Nota importante: Usamos req.clinicClient, no supabase
+    const { data, error } = await req.clinicClient.rpc('obtener_estadisticas_generales');
 
     if (error) {
       console.error('Error obteniendo métricas:', error);
       return res.status(500).json({ error: 'Error al calcular estadísticas' });
     }
 
-    // Enviamos el JSON limpio al frontend
     res.json(data);
 
   } catch (err) {
